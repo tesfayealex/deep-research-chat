@@ -1,0 +1,12 @@
+fastapi
+uvicorn[standard]
+pydantic
+python-dotenv
+
+# LangChain and related dependencies
+langchain
+langgraph
+langchain-openai
+langchain_community
+tavily-python
+langchainhub # For pulling prompts if needed 
