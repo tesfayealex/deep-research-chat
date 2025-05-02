@@ -12,7 +12,7 @@ export interface Message {
   text: string;
   // Optional fields for streaming progress
   isStreaming?: boolean;
-  plan?: string[];
+  plan?: { step_name: string; step_detail: string }[]; 
   status?: string;
   thinking?: any[]; // Add thinking field to store step results
 }
@@ -42,7 +42,8 @@ export default function ChatLayout() {
         text: '', // Start empty
         isStreaming: true,
         status: 'Connecting...',
-        plan: [],
+        plan: [], // Initialize as empty array
+        thinking: [], // Initialize thinking
     };
     // Add placeholder agent message
     setMessages(prev => [...prev, initialAgentMessage]);
@@ -102,24 +103,46 @@ export default function ChatLayout() {
                             updatedMsg.status = update.data;
                             updatedMsg.text = updatedMsg.text || ''; // Ensure text isn't null
                         } else if (update.type === 'plan') {
+                            // Store the structured plan
                             updatedMsg.plan = update.data;
+                            // Format the plan for display in the text field for now
+                            // We will refine this in message-bubble.tsx later
+                            const planText = update.data.map((step: { step_name: string, step_detail: string }, index: number) => 
+                                `${index + 1}. ${step.step_name}: ${step.step_detail}`
+                            ).join('\n');
+                            updatedMsg.text = `Okay, here is the plan:\n${planText}`;
                             updatedMsg.status = 'Executing plan...'; // Update status
-                            updatedMsg.text = updatedMsg.text || '';
                         } else if (update.type === 'step_result') {
                             // Store step results in the thinking array
                             updatedMsg.thinking = updatedMsg.thinking || [];
-                            updatedMsg.thinking.push(update.data);
-                            updatedMsg.status = 'Processing results...'; // Update status
+                            // Make sure we don't have duplicates if stream resends
+                            if (!updatedMsg.thinking.some(t => t.step_index === update.data.step_index)) {
+                                updatedMsg.thinking.push(update.data);
+                            }
+                            // Display findings preview in the main text for now?
+                            // updatedMsg.text += `\nStep ${update.data.step_index + 1} findings: ${update.data.findings_preview}`;
+                            updatedMsg.status = `Executing Step ${update.data.step_index + 2}...`; // Update status
+                            updatedMsg.text = updatedMsg.text || ''; // Ensure text isn't null
+                        } else if (update.type === 'evaluation') {
+                            updatedMsg.status = update.data.status;
+                            // Optionally add evaluation text
+                            // updatedMsg.text += `\nEvaluation: ${update.data.status}`;
                             updatedMsg.text = updatedMsg.text || '';
                         } else if (update.type === 'report') {
                             updatedMsg.text = update.data; // Final report content
                             updatedMsg.status = 'Finished';
                             updatedMsg.isStreaming = false; // Mark as finished
-                            // Don't clear thinking data here
+                            updatedMsg.thinking = updatedMsg.thinking || []; // Ensure thinking is array
                         } else if (update.type === 'error') {
                             updatedMsg.text = `Error: ${update.data}`;
                             updatedMsg.status = 'Error';
                             updatedMsg.isStreaming = false;
+                        } else if (update.type === 'complete') {
+                            // Stream ended normally, mark streaming finished if not already
+                            updatedMsg.isStreaming = false;
+                            if (!updatedMsg.status || updatedMsg.status.includes('...')) {
+                                updatedMsg.status = 'Finished'; // Set final status if needed
+                            } 
                         }
                         // Update the ref as well for potential direct access if needed
                         if (streamingMessageRef.current?.id === agentMessageId) {

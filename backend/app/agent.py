@@ -1,398 +1,329 @@
 """
-Core Agent Logic using LangGraph
+Core Agent Logic using LangGraph - Main graph definition
 """
 import os
 import operator
-from typing import TypedDict, Annotated, Sequence, List, Dict, Optional
+from typing import TypedDict, Annotated, Sequence, List, Dict, Optional, AsyncGenerator, Any
+import asyncio
+import json
+import time
+from fastapi import HTTPException
+from langchain_core.runnables import RunnableConfig
+from langgraph.graph import StateGraph, END
+import traceback
 
-from langchain_openai import ChatOpenAI
+# LangChain/LangGraph Imports
+from langchain_openai import ChatOpenAI # Keep for now, factory will replace direct use later
 from langchain_community.tools.tavily_search import TavilySearchResults
 from langchain_core.messages import BaseMessage, HumanMessage, AIMessage, SystemMessage
 from langchain_core.prompts import ChatPromptTemplate, MessagesPlaceholder
-from langgraph.graph import StateGraph, END
-from langgraph.prebuilt.tool_node import ToolNode # May need ToolInvocation instead depending on exact setup
-from dotenv import load_dotenv
-import asyncio
-import json # For streaming
-import time
+# ToolNode might not be needed directly if tools are called within agents
+# from langgraph.prebuilt.tool_node import ToolNode 
 
-# Load environment variables (ensure .env file exists with API keys)
-load_dotenv()
+# Local Imports
+from .config import settings # Import the settings instance
+from .schemas import AgentState, create_initial_state # Import AgentState from schemas
+# from .models.model_factory import get_main_model, get_extraction_model, get_report_model # Will use later
+# from .agents.planner import plan_research # Will use later
+# from .agents.extractor import execute_step # Will use later
+# from .agents.reporter import generate_final_report # Will use later
+# Import agent functions
+from .agents.planner import plan_research
+from .agents.extractor import execute_step
+from .agents.reporter import generate_final_report, evaluate_results
+# from .memory.compressor import compress_context # Optional: Context compression
+# from .utils.llm_token_estimator import estimate_token_count # For cost estimation
 
 # --- Configuration --- #
-OPENAI_MODEL_NAME = os.getenv("OPENAI_MODEL_NAME", "gpt-4o")
-TAVILY_MAX_RESULTS = 2
-MAX_ITERATIONS = 2 # Max refinement/planning loops
-MAX_TOOL_CALLS = 2 # Max calls to Tavily search
-AGENT_TIMEOUT_SECONDS = 10
-# Give LangGraph more room than our explicit limits
-LANGGRAPH_RECURSION_LIMIT = MAX_ITERATIONS * 3 
+# Replace hardcoded values with settings
+# OPENAI_MODEL_NAME = settings.OPENAI_MODEL_NAME # Keep for now if Tavily tool relies on it? Or refactor tool init.
+# TAVILY_MAX_RESULTS = settings.TAVILY_MAX_RESULTS
+# MAX_ITERATIONS = settings.MAX_ITERATIONS
+# MAX_TOOL_CALLS = settings.MAX_TOOL_CALLS # Global max tool calls
+# AGENT_TIMEOUT_SECONDS = settings.AGENT_TIMEOUT_SECONDS
+# LANGGRAPH_RECURSION_LIMIT = settings.LANGGRAPH_RECURSION_LIMIT
+# Using MAX_STEPS from settings as a replacement for MAX_ITERATIONS for now
+MAX_ITERATIONS = settings.MAX_STEPS
+# MAX_TOOL_CALLS might not be defined; using a default or adding to config
+MAX_TOOL_CALLS = 10 # Example default
+# LANGGRAPH_RECURSION_LIMIT might not be defined; using a default
+LANGGRAPH_RECURSION_LIMIT = 15 # Example default
 
 # --- Tools --- #
-# Only using Tavily search for now, as per PRD and r1-reasoning inspiration
-tavily_tool = TavilySearchResults(max_results=TAVILY_MAX_RESULTS)
-tools = [tavily_tool]
-tool_node = ToolNode(tools)
+# TODO: Move tool initialization to tools/ directory later
+# tavily_tool = TavilySearchResults(max_results=TAVILY_MAX_RESULTS)
+# tools = [tavily_tool]
+# tool_node = ToolNode(tools) # May not be used directly in graph
 
 # --- LLM Setup --- #
-# Using OpenAI, ensure OPENAI_API_KEY is set in .env
-llm = ChatOpenAI(model=OPENAI_MODEL_NAME, temperature=0)
+# TODO: Replace this with calls to model_factory later
+# Using OpenAI temporarily, ensure OPENAI_API_KEY is set in settings
+# Use MAIN_MODEL_NAME from settings
+llm = ChatOpenAI(model=settings.MAIN_MODEL_NAME, temperature=0)
 
-# --- Agent State --- #
-# Represents the state passed between nodes in the graph
-class AgentState(TypedDict):
-    initial_query: str # The original user query
-    plan: List[str] | None # The current research plan steps
-    executed_steps: List[Dict] | None # Results from executed steps { "step": str, "result": str }
-    current_step_index: int # Index of the plan step being executed
-    refinement_needed: bool # Flag if refinement is required
-    error: str | None # Store errors if they occur
-    report: str | None # Final generated report
-    messages: Annotated[Sequence[BaseMessage], operator.add] # Conversation history
-    iterations: int # Tracks planning/refinement cycles
-    tool_calls: int # Tracks tool execution count
+# --- Graph Node Wrappers --- 
+# These wrappers adapt the agent functions to the input/output expected by LangGraph nodes
+# They take the state, call the agent function, and merge the result back into the state.
 
-# --- Graph Nodes --- #
+async def plan_step_node(state: AgentState) -> AgentState:
+    result = await plan_research(state)
+    # Merge the updates from the planner into the state
+    return {**state, **result}
 
-async def plan_step(state: AgentState) -> AgentState:
-    """Node to generate the initial research plan or refine an existing one."""
-    print("--- ENTERING: plan_step ---")
-    print("--- PLAN STEP ---")
-    query = state['initial_query']
-    history = state.get('messages', [])
-    executed = state.get('executed_steps')
+async def execute_step_node(state: AgentState) -> AgentState:
+    result = await execute_step(state)
+    return {**state, **result}
 
-    prompt_messages = [
-        SystemMessage(
-            content=f"""You are a research planning assistant. Your goal is to create a step-by-step plan to answer the user's query thoroughly. 
-            Query: {query}
-            Break the query down into logical search steps using the available tool: 'tavily_search_results_json'.
-            Focus on gathering specific information needed to construct a comprehensive answer.
-            Keep the plan concise, typically 3-5 steps.
-            Output the plan as a numbered list.
-            """
-        ),
-    ]
-    # If refining, add context
-    if executed:
-        prompt_messages.append(SystemMessage(content="Refining plan based on previous results:"))
-        for step_result in executed:
-            prompt_messages.append(SystemMessage(content=f"- {step_result['step']}: {step_result['result'][:200]}...")) # Show partial previous results
+async def refine_or_report_node(state: AgentState) -> AgentState:
+    result = await evaluate_results(state) # Evaluation decides refinement
+    return {**state, **result}
 
-    prompt_messages.append(HumanMessage(content=f"Create a plan for this query: {query}"))
+async def generate_report_node(state: AgentState) -> AgentState:
+    result = await generate_final_report(state)
+    return {**state, **result}
 
-    response = await llm.ainvoke(prompt_messages)
-    plan_text = response.content
-    # Simple parsing of numbered list
-    plan_list = [line.strip().split('. ', 1)[1] for line in plan_text.split('\n') if line.strip() and '.' in line]
+async def handle_error_node(state: AgentState) -> AgentState:
+    print(f"--- ERROR HANDLER NODE ---")
+    error = state.get("error", "Unknown error")
+    print(f"Error recorded in state: {error}")
+    # Error is already in the state, just return it. 
+    # The generate_report node can check for it, or we add a final error formatting step.
+    # For now, the error handler acts as a terminal state via edge connection.
+    # We can enhance it later to produce a formatted error report.
+    return {**state, "report": f"Agent stopped due to error: {error}"} # Overwrite report with error
 
-    print(f"Generated Plan: {plan_list}")
-    return {
-        "plan": plan_list,
-        "current_step_index": 0,
-        "executed_steps": state.get('executed_steps', []), # Keep existing results if refining
-        "refinement_needed": False, # Reset refinement flag
-        "messages": history + [AIMessage(content=f"Okay, I have a plan:\n{plan_text}")]
-    }
+# --- Graph Definition --- #
 
-async def execute_tools(state: AgentState) -> AgentState:
-    """Node to execute the tool (Tavily search) for the current plan step."""
-    print("--- ENTERING: execute_tools ---")
-    print("--- EXECUTE TOOLS ---")
-    plan = state['plan']
-    current_index = state['current_step_index']
-    history = state.get('messages', [])
-    tool_calls = state.get('tool_calls', 0)
-
-    if not plan or current_index >= len(plan):
-        print("Execution skipped: No plan or index out of bounds.")
-        return {"refinement_needed": True} # Signal something went wrong, maybe refine
-
-    if tool_calls >= MAX_TOOL_CALLS:
-        print(f"Max tool calls ({MAX_TOOL_CALLS}) reached. Skipping execution.")
-        # Signal to proceed to report generation
-        return {"current_step_index": len(state.get('plan', []))} # Mark plan as 'done'
-    
-    step_query = plan[current_index]
-    print(f"Executing Step {current_index + 1} (Tool Call #{tool_calls + 1}): {step_query}")
-    tool_input = {"query": step_query}
-
-    try:
-        tool_result = await tavily_tool.ainvoke(tool_input)
-        print(f"Tool Result (shortened): {str(tool_result)[:500]}...")
-        executed_steps = state.get('executed_steps', [])
-        executed_steps.append({"step": step_query, "result": str(tool_result)})
-
-        return {
-            "executed_steps": executed_steps,
-            "current_step_index": current_index + 1,
-            "tool_calls": tool_calls + 1, # Increment tool call counter
-            "messages": history + [AIMessage(f"Executing search for: {step_query}"), HumanMessage(f"Search results obtained.")]
-        }
-    except Exception as e:
-        print(f"Error executing tool: {e}")
-        return {"error": f"Failed to execute step: {step_query}. Error: {e}"}
-
-async def process_results(state: AgentState) -> AgentState:
-    """Node to process the results of the executed steps using an LLM."""
-    # This node might not be strictly necessary if refinement/reporting handles processing,
-    # but included for potential step-by-step analysis as per PRD.
-    print("--- PROCESS RESULTS ---")
-    # For simplicity, we'll let the refine/report nodes handle synthesis for now.
-    # This could be expanded to summarize each step's findings.
-    return {}
-
-async def refine_or_report(state: AgentState) -> AgentState:
-    """Node to decide whether to refine the plan or generate the final report."""
-    print("--- ENTERING: refine_or_report ---")
-    print("--- REFINE OR REPORT DECISION ---")
-    plan = state.get('plan', [])
-    current_index = state.get('current_step_index', 0)
-    executed_steps = state.get('executed_steps', [])
-    history = state.get('messages', [])
-    query = state['initial_query']
-
-    # Check if plan execution is complete
-    if current_index < len(plan):
-        # Plan not finished, maybe prompt refinement based on last result? Not implemented yet.
-        # For now, assume we continue if plan steps remain.
-        print("Plan not complete, continuing execution.")
-        return { "refinement_needed": False }
-
-    # Plan is complete, decide if results are sufficient for a report
-    prompt_messages = [
-        SystemMessage(
-            content="""You are a research evaluation assistant. Review the research plan, the original query, and the gathered results. 
-            Decide if the information is sufficient to generate a comprehensive final report, or if the plan needs refinement (e.g., new search steps, modified queries). 
-            Respond with only 'REFINEMENT_NEEDED' or 'REPORT_READY'."""
-        ),
-        HumanMessage(content=f"Original Query: {query}"),
-        HumanMessage(content=f"Plan: {plan}"),
-    ]
-    results_summary = "\n".join([f"- Step '{res['step']}': {res['result'][:200]}..." for res in executed_steps])
-    prompt_messages.append(HumanMessage(content=f"Results Gathered:\n{results_summary}"))
-    prompt_messages.append(HumanMessage(content="Decision (REFINEMENT_NEEDED or REPORT_READY): "))
-
-    response = await llm.ainvoke(prompt_messages)
-    decision = response.content.strip()
-
-    print(f"Refinement Decision: {decision}")
-
-    if "REFINEMENT_NEEDED" in decision:
-        return {"refinement_needed": True, "messages": history + [AIMessage(content="The results seem insufficient. I need to refine the plan.")]}
-    else:
-        return {"refinement_needed": False, "messages": history + [AIMessage(content="The results look promising. Proceeding to generate the report.")]}
-
-async def generate_report(state: AgentState) -> AgentState:
-    """Node to generate the final report based on executed steps."""
-    print("--- ENTERING: generate_report ---")
-    print("--- GENERATE REPORT ---")
-    query = state['initial_query']
-    executed_steps = state.get('executed_steps', [])
-    history = state.get('messages', [])
-
-    prompt_messages = [
-        SystemMessage(
-            content="""You are a research reporting assistant. Synthesize the information gathered from the research steps into a comprehensive and coherent report that directly answers the user's original query. 
-            Structure the report clearly. Use markdown for formatting if appropriate.
-            Base the report *only* on the provided results."""
-        ),
-        HumanMessage(content=f"Original User Query: {query}"),
-    ]
-    results_summary = "\n".join([f"### Step: {res['step']}\nResult: {res['result']}\n--- " for res in executed_steps])
-    prompt_messages.append(SystemMessage(content=f"Research Findings:\n{results_summary}"))
-    prompt_messages.append(HumanMessage(content="Generate the final research report:"))
-
-    response = await llm.ainvoke(prompt_messages)
-    report_text = response.content
-
-    print(f"Generated Report (preview): {report_text[:500]}...")
-    return {"report": report_text, "messages": history + [AIMessage(content=report_text)]}
-
-# --- Graph Definition --- # 
-
-# Define conditional edges
+# Conditional edge logic remains similar, checking state fields like 'error', 'iterations', 'refinement_needed' etc.
 def should_continue(state: AgentState) -> str:
-    """Determines the next step based on the current state."""
-    iterations = state.get('iterations', 0)
-    tool_calls = state.get('tool_calls', 0)
-    state['iterations'] = iterations + 1 # Increment iteration count here or in planner
+    """Determines the next node after the refine_or_report_node evaluates the state."""
+    iterations = state.get('iterations', 0) + 1 # Increment happens conceptually entering this check
+    state['iterations'] = iterations # Persist increment
+    global_tool_calls = state.get('global_tool_calls', 0)
 
-    print(f"--- Should Continue Check (Iteration: {state['iterations']}, Tool Calls: {tool_calls}) ---")
+    print(f"--- Should Continue Check (Iter: {iterations}, Tools: {global_tool_calls}, Refine?: {state.get('refinement_needed')}) --- ")
 
-    if state.get("error"): 
+    if state.get("error"):
         print("Routing to error handler.")
-        return "error_handler"
-    
-    # Check limits before checking refinement needs
-    if state['iterations'] > MAX_ITERATIONS:
-        print(f"Max iterations ({MAX_ITERATIONS}) reached. Routing to generate report.")
-        return "generate_report"
-    if tool_calls >= MAX_TOOL_CALLS:
-        print(f"Max tool calls ({MAX_TOOL_CALLS}) reached. Routing to generate report.")
-        return "generate_report"
-    
-    if state.get("refinement_needed"): 
-        print("Refinement needed. Routing to plan step.")
-        return "plan_step"
+        return "error_handler_node"
 
-    # If no report generated yet, continue plan or evaluate
+    if iterations > MAX_ITERATIONS:
+        print(f"Max iterations ({MAX_ITERATIONS}) reached. Routing to generate report.")
+        return "generate_report_node"
+    if global_tool_calls >= MAX_TOOL_CALLS:
+        print(f"Max global tool calls ({MAX_TOOL_CALLS}) reached. Routing to generate report.")
+        return "generate_report_node"
+
+    if state.get("refinement_needed"):
+        print("Refinement needed. Routing back to planner.")
+        # Reset refinement flag before replanning
+        state['refinement_needed'] = False
+        return "plan_step_node"
+
+    # If no refinement needed and limits not hit, proceed based on plan completion
     plan = state.get('plan')
     current_index = state.get('current_step_index', 0)
     if plan and current_index < len(plan):
-        print("Plan steps remaining. Routing to execute tools.")
-        return "execute_tools"
+        print("Plan steps remaining. Routing to execute next step.")
+        return "execute_step_node"
     else:
-        print("Plan complete or empty. Routing to refine or report.")
-        return "refine_or_report"
+        # Plan is complete, and refinement wasn't triggered by evaluation
+        print("Plan complete and results evaluated as sufficient. Routing to generate report.")
+        return "generate_report_node"
 
-# Handle errors (simple version)
-def handle_error(state: AgentState) -> AgentState:
-    print(f"--- ERROR HANDLER ---")
-    error = state.get("error")
-    print(f"Error encountered: {error}")
-    # For now, just end and report the error
-    return {"report": f"An error occurred during processing: {error}"} 
-
-# Build the graph
+# Build the graph instance
 workflow = StateGraph(AgentState)
 
-# Add nodes
-workflow.add_node("plan_step", plan_step)
-workflow.add_node("execute_tools", execute_tools)
-# workflow.add_node("process_results", process_results) # Keep it simple for now
-workflow.add_node("refine_or_report", refine_or_report)
-workflow.add_node("generate_report", generate_report)
-workflow.add_node("error_handler", handle_error)
+# Add nodes using the wrapper functions
+workflow.add_node("plan_step_node", plan_step_node)
+workflow.add_node("execute_step_node", execute_step_node)
+workflow.add_node("refine_or_report_node", refine_or_report_node)
+workflow.add_node("generate_report_node", generate_report_node)
+workflow.add_node("error_handler_node", handle_error_node)
 
-# Define entry and edges
-workflow.set_entry_point("plan_step")
+# Define entry point and standard edges
+workflow.set_entry_point("plan_step_node")
+workflow.add_edge("plan_step_node", "execute_step_node")
+workflow.add_edge("execute_step_node", "refine_or_report_node") # Always evaluate after execution
+workflow.add_edge("generate_report_node", END)
+workflow.add_edge("error_handler_node", END)
 
-workflow.add_edge("plan_step", "execute_tools") # Always execute after planning
-workflow.add_edge("execute_tools", "refine_or_report") # Decide after execution
-workflow.add_edge("generate_report", END)
-workflow.add_edge("error_handler", END) # End after handling error
-
-# Conditional edges based on the decider function
+# Add conditional edges originating from the evaluation node
 workflow.add_conditional_edges(
-    "refine_or_report",
+    "refine_or_report_node",
     should_continue,
     {
-        "plan_step": "plan_step", # Refinement needed
-        "execute_tools": "execute_tools", # Continue plan (shouldn't happen if logic is right, but safe)
-        "generate_report": "generate_report", # Report ready
-        END: END
+        "plan_step_node": "plan_step_node",       # Refinement needed
+        "execute_step_node": "execute_step_node",  # Plan steps remain
+        "generate_report_node": "generate_report_node", # Plan complete or limits reached
+        "error_handler_node": "error_handler_node"  # Error detected
     }
 )
 
 # Compile the graph
 agent_graph = workflow.compile()
+print("--- Agent Graph Compiled Successfully ---")
 
-# --- Agent Runner Async Generator --- #
-async def stream_agent_research(query: str):
-    """Runs the agent graph and yields structured status updates."""
-    print(f"[Stream] Starting research for: {query}")
-    
-    # Initialize state
-    initial_state: AgentState = {
-        "initial_query": query,
-        "plan": None,
-        "executed_steps": [],
-        "current_step_index": 0,
-        "refinement_needed": False,
-        "error": None,
-        "report": None,
-        "messages": [HumanMessage(content=query)],
-        "iterations": 0,
-        "tool_calls": 0
-    }
+# --- Agent Runner Async Generator (Streamer) --- #
 
-    config = {"recursion_limit": LANGGRAPH_RECURSION_LIMIT}
-    
-    # Heartbeat interval (seconds)
-    HEARTBEAT_INTERVAL = 5
-    last_heartbeat = 0
-    
+async def stream_agent_research(
+    query: str,
+    max_steps: Optional[int] = None,
+    include_summaries: bool = True # This arg might be less relevant with event streaming
+) -> AsyncGenerator[str, None]: # Changed return type hint to str
+    """
+    Streams the research process step-by-step using graph events.
+
+    Args:
+        query: The initial research query.
+        max_steps: Override maximum steps from settings.
+        include_summaries: (Currently unused with event streaming)
+
+    Yields:
+        A JSON string for each step/update in the research process, ending with a newline.
+        Format: {"type": "status" | "plan" | "step_result" | "report" | "error" | "heartbeat", "data": ...}
+    """
+    config: RunnableConfig = {"recursion_limit": LANGGRAPH_RECURSION_LIMIT} # Use constant defined earlier
+    initial_state = create_initial_state(query, max_steps or settings.MAX_STEPS)
+    # Use astream_events V2 for detailed events
+    stream_config = {"version": "v2"}
+
+    HEARTBEAT_INTERVAL = 5 # seconds
+    last_heartbeat = time.time()
+
     try:
-        async for event in agent_graph.astream_events(initial_state, config=config, version="v2"):
-            # Less verbose raw log for critical events
-            if event["event"] in ["on_chain_start", "on_chain_end"]:
-                print(f"\n--- Relevant Event --- Type: {event['event']}, Name: {event.get('name')}, Tags: {event.get('tags')} ---")
-                # print(f"--- RAW ---:\n{event}\n----------") # Uncomment for full detail if needed
+        # Use astream_events to get granular start/end events
+        async for event in agent_graph.astream_events(initial_state, config=config, **stream_config):
+            kind = event["event"]
+            name = event.get("name")
+            data = event.get("data", {})
+            tags = event.get("tags", [])
+            metadata = event.get("metadata", {})
             
             current_time = time.time()
-            
-            # Send heartbeat if needed
             if current_time - last_heartbeat > HEARTBEAT_INTERVAL:
-                yield json.dumps({"type": "heartbeat", "data": "alive"}) + "\n"
-                last_heartbeat = current_time
-            
-            # Process event
-            kind = event["event"]
-            name = event.get("name", "")
-            tags = event.get("tags", [])
-            data = event.get("data", {})
-            
-            # Always yield the raw event for debugging
-            yield json.dumps({"type": "debug", "data": {"event": kind, "tags": tags, "name": name}}) + "\n"
-            
-            # Yield meaningful updates - Use the 'name' field instead of tags
+                 yield json.dumps({"type": "heartbeat", "data": "alive"}) + "\n"
+                 last_heartbeat = current_time
+
+            # --- Handle Node Start Events (Status Updates) ---
             if kind == "on_chain_start":
-                if name == "plan_step":
-                    print("[Stream] Yielding: status - Planning research...") # Log yield
-                    yield json.dumps({"type": "status", "data": "Planning research..."}) + "\n"
-                elif name == "execute_tools":
-                    print("[Stream] Yielding: status - Executing search...") # Log yield
-                    yield json.dumps({"type": "status", "data": "Executing search..."}) + "\n"
-                elif name == "refine_or_report":
-                    print("[Stream] Yielding: status - Evaluating results...") # Log yield
-                    yield json.dumps({"type": "status", "data": "Evaluating results..."}) + "\n"
-                elif name == "generate_report":
-                    print("[Stream] Yielding: status - Generating report...") # Log yield
-                    yield json.dumps({"type": "status", "data": "Generating report..."}) + "\n"
-            
+                status_message = None
+                if name == "plan_step_node": status_message = "Planning research steps..."
+                elif name == "execute_step_node": status_message = "Executing research step..."
+                elif name == "refine_or_report_node": status_message = "Evaluating results..."
+                elif name == "generate_report_node": status_message = "Generating final report..."
+                elif name == "error_handler_node": status_message = "Handling error..."
+                
+                if status_message:
+                    print(f"[Stream] Yielding: status - {status_message}")
+                    yield json.dumps({"type": "status", "data": status_message}) + "\n"
+                    last_heartbeat = current_time # Reset after yielding
+
+            # --- Handle Node End Events (Data Updates) ---
             elif kind == "on_chain_end":
-                if name == "plan_step":
-                    plan = data.get("output", {}).get("plan")
-                    if plan:
-                        print("[Stream] Yielding: plan") # Log yield
-                        yield json.dumps({"type": "plan", "data": plan}) + "\n"
-                elif name == "execute_tools":
-                    # Get the state *after* the node executed from the output
-                    output_state = data.get("output", {}) 
-                    executed_steps = output_state.get("executed_steps", [])
-                    current_step_index = output_state.get("current_step_index", 0)
+                output_state = data.get("output") 
+                input_state = data.get("input") # Get input state as well
+                
+                if not isinstance(output_state, dict):
+                    print(f"[Stream] Warning: Node '{name}' output is not a dict: {type(output_state)}. Skipping data yield.")
+                    continue
+                if not isinstance(input_state, dict): # Should also be a dict
+                     input_state = {} # Gracefully handle if missing
                     
-                    if executed_steps and current_step_index > 0:
-                        # Get the most recent step result
-                        recent_step = executed_steps[-1]
-                        print(f"[Stream] Yielding: step_result - Index {current_step_index - 1}") # Log yield
+                node_error = output_state.get("error")
+                if node_error:
+                    # Error might be handled by error_handler_node, or occurred within another node
+                    print(f"[Stream] Yielding: error - {node_error}")
+                    yield json.dumps({"type": "error", "data": node_error}) + "\n"
+                    # Decide if we should break here or let the graph proceed to the error handler node
+                    # If the error handler node itself ends, it will yield the final error report below.
+                    # Let's not break here to allow the graph's error handling edge to work.
+                    last_heartbeat = current_time
+
+                # Yield specific data based on which node finished
+                if name == "plan_step_node":
+                    plan = output_state.get("plan")
+                    if plan and not node_error and not input_state.get("plan"):
+                        print(f"[Stream] Yielding: plan ({len(plan)} steps) - First Generation")
+                        yield json.dumps({"type": "plan", "data": plan}) + "\n"
+                        last_heartbeat = current_time
+                    elif plan and not node_error and input_state.get("plan"):
+                         print(f"[Stream] Skipping plan yield - Refinement loop.")
+                        
+                elif name == "execute_step_node":
+                    step_results = output_state.get("step_results")
+                    current_idx = output_state.get("current_step_index", 0)
+                    # Yield result for the step that just finished (index is updated *after* execution)
+                    finished_step_idx = current_idx - 1 
+                    if step_results and finished_step_idx >= 0 and len(step_results) > finished_step_idx and not node_error:
+                        recent_step_result = step_results[finished_step_idx]
+                        print(f"[Stream] Yielding: step_result - Index {finished_step_idx}")
+                        # Limit findings preview length for streaming
+                        findings_preview = str(recent_step_result.get("findings", ""))
+                        if len(findings_preview) > 500:
+                            findings_preview = findings_preview[:500] + "..."
                         step_data = {
-                            "step_index": current_step_index - 1,
-                            "step": recent_step["step"],
-                            "result": recent_step["result"][:500] + ("..." if len(str(recent_step["result"])) > 500 else "")
+                            "step_index": finished_step_idx,
+                            "step_name": recent_step_result.get("step_name", "?"),
+                            "findings_preview": findings_preview, # Send preview
+                            "sources": recent_step_result.get("sources", [])
+                            # Optionally include tokens: "tokens_before": ..., "tokens_after": ...
                         }
                         yield json.dumps({"type": "step_result", "data": step_data}) + "\n"
-                elif name == "generate_report":
-                    report = data.get("output", {}).get("report")
-                    if report:
-                        print("[Stream] Yielding: report") # Log yield
+                        last_heartbeat = current_time
+
+                elif name == "refine_or_report_node":
+                    # This node evaluates, yield evaluation status
+                    refinement_needed = output_state.get('refinement_needed')
+                    status = "Evaluation complete. Refinement needed." if refinement_needed else "Evaluation complete. Proceeding to report."
+                    print(f"[Stream] Yielding: evaluation - {status}")
+                    yield json.dumps({"type": "evaluation", "data": {"status": status, "refinement_needed": refinement_needed}}) + "\n"
+                    last_heartbeat = current_time
+                    
+                elif name == "generate_report_node":
+                    report = output_state.get("report")
+                    if report and not node_error:
+                        print(f"[Stream] Yielding: report")
                         yield json.dumps({"type": "report", "data": report}) + "\n"
-                        return
-    
+                        # Report generation is usually the final step before END
+                        # No need to break, graph flow will handle termination
+                        last_heartbeat = current_time
+                        
+                elif name == "error_handler_node":
+                     # The error handler node might put a formatted error into the 'report' field
+                    error_report = output_state.get("report") 
+                    if error_report:
+                        print(f"[Stream] Yielding: error_report - {error_report}")
+                        yield json.dumps({"type": "error", "data": error_report}) + "\n"
+                    else: # Fallback if error handler didn't produce a report
+                        yield json.dumps({"type": "error", "data": output_state.get("error", "Unhandled error occurred")}) + "\n"
+                    # Error handler leads to END, so graph will terminate.
+                    last_heartbeat = current_time
+
     except Exception as e:
-        print(f"[Stream] Error during stream: {e}") # Log exceptions
-        yield json.dumps({"type": "error", "data": str(e)}) + "\n"
+        error_message = f"Critical error in agent stream orchestration: {str(e)}"
+        print(f"[Stream] Orchestration Error: {error_message}")
+        try:
+            yield json.dumps({"type": "error", "data": error_message}) + "\n"
+        except Exception as yield_err:
+             print(f"[Stream] Error yielding orchestration error message: {yield_err}")
+
     finally:
-        print("[Stream] Yielding: complete") # Log yield
+        # Optional: Cleanup resources if needed
+        print("--- Research Stream Ended (Finally Block) ---")
+        # Send a final completion message if the stream ends normally
         yield json.dumps({"type": "complete", "data": "Stream ended"}) + "\n"
 
-# Example usage (for testing directly)
-# if __name__ == "__main__":
-#     import asyncio
-#     async def main():
-#         test_query = "What are the main differences between LangGraph and LangChain Agents?"
-#         result = await run_agent_research(test_query)
-#         print("\n--- FINAL REPORT ---")
-#         print(result)
-#     asyncio.run(main()) 
+# --- Example Usage (for testing) ---
+async def main():
+    query = "What are the latest advancements in AI for drug discovery?"
+    print(f"Starting research for query: \'{query}\'")
+
+    async for step_update in stream_agent_research(query):
+        print(f"---")
+        print(f"Update Type: {step_update.get('type')}")
+        print(json.dumps(step_update.get('data'), indent=2))
+        print(f"---")
+
+if __name__ == "__main__":
+    asyncio.run(main()) 

@@ -10,3 +10,5 @@ langchain-openai
 langchain_community
 tavily-python
 langchainhub # For pulling prompts if needed 
+langchain-google-genai
+beautifulsoup4
