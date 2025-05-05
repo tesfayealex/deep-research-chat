@@ -7,10 +7,15 @@ from typing import TypedDict, Annotated, Sequence, List, Dict, Optional, AsyncGe
 import asyncio
 import json
 import time
+from datetime import datetime, timezone # For timestamping
+import uuid # For generating conversation IDs
+
 from fastapi import HTTPException
 from langchain_core.runnables import RunnableConfig
 from langgraph.graph import StateGraph, END
 import traceback
+from datetime import datetime, timezone # For timestamping
+import uuid # For generating conversation IDs
 
 # LangChain/LangGraph Imports
 from langchain_openai import ChatOpenAI # Keep for now, factory will replace direct use later
@@ -33,6 +38,13 @@ from .agents.extractor import execute_step
 from .agents.reporter import generate_final_report, evaluate_results
 # from .memory.compressor import compress_context # Optional: Context compression
 # from .utils.llm_token_estimator import estimate_token_count # For cost estimation
+# Import the Weaviate saving function
+from .vectorstore.weaviate_client import save_event_to_weaviate, get_weaviate_client
+# Import the custom serialization utility
+from .utils.serialization import safe_serialize
+
+# --- Initialize Weaviate Client on startup (optional but recommended) ---
+get_weaviate_client() 
 
 # --- Configuration --- #
 # Replace hardcoded values with settings
@@ -61,14 +73,43 @@ LANGGRAPH_RECURSION_LIMIT = 15 # Example default
 # Use MAIN_MODEL_NAME from settings
 llm = ChatOpenAI(model=settings.MAIN_MODEL_NAME, temperature=0)
 
+# --- Custom JSON Encoder for LangChain Objects ---
+class LangChainObjectEncoder(json.JSONEncoder):
+    def default(self, obj):
+        if isinstance(obj, BaseMessage):
+            # Use LangChain's serialization helper or .dict()
+            try:
+                # dumpd is generally preferred for LC objects
+                return dumpd(obj) 
+            except Exception:
+                # Fallback if dumpd fails for some reason
+                print(f"Warning: dumpd failed for {type(obj)}. Falling back to basic dict.")
+                return obj.dict() 
+        # Let the base class default method raise the TypeError for other types
+        try:
+            return super().default(obj)
+        except TypeError:
+             # Fallback for other potentially unserializable objects
+             print(f"Warning: Cannot serialize object of type {type(obj)}. Returning string representation.")
+             return str(obj) 
+
 # --- Graph Node Wrappers --- 
 # These wrappers adapt the agent functions to the input/output expected by LangGraph nodes
 # They take the state, call the agent function, and merge the result back into the state.
 
 async def plan_step_node(state: AgentState) -> AgentState:
-    result = await plan_research(state)
-    # Merge the updates from the planner into the state
-    return {**state, **result}
+    print("--- Entering plan_step_node ---")
+    try:
+        # print(f"Current state before planning: {state}")
+        result = await plan_research(state)
+        # print(f"--- plan_research completed successfully. Result: {result} ---")
+        # Merge the updates from the planner into the state
+        return {**state, **result}
+    except Exception as e:
+        # print(f"--- ERROR in plan_step_node: {e} ---")
+        traceback.print_exc() # Print full traceback
+        # Propagate error into state for the graph to handle
+        return {**state, "error": f"Failed during planning: {str(e)}"}
 
 async def execute_step_node(state: AgentState) -> AgentState:
     result = await execute_step(state)
@@ -169,150 +210,211 @@ print("--- Agent Graph Compiled Successfully ---")
 async def stream_agent_research(
     query: str,
     max_steps: Optional[int] = None,
-    include_summaries: bool = True # This arg might be less relevant with event streaming
-) -> AsyncGenerator[str, None]: # Changed return type hint to str
+    include_summaries: bool = True 
+) -> AsyncGenerator[str, None]: 
     """
-    Streams the research process step-by-step using graph events.
-
-    Args:
-        query: The initial research query.
-        max_steps: Override maximum steps from settings.
-        include_summaries: (Currently unused with event streaming)
-
-    Yields:
-        A JSON string for each step/update in the research process, ending with a newline.
-        Format: {"type": "status" | "plan" | "step_result" | "report" | "error" | "heartbeat", "data": ...}
+    Streams the research process step-by-step using graph events,
+    saves distinct agent_yield and agent_internal_state events to Weaviate.
     """
-    config: RunnableConfig = {"recursion_limit": LANGGRAPH_RECURSION_LIMIT} # Use constant defined earlier
+    config: RunnableConfig = {"recursion_limit": LANGGRAPH_RECURSION_LIMIT}
     initial_state = create_initial_state(query, max_steps or settings.MAX_STEPS)
-    # Use astream_events V2 for detailed events
     stream_config = {"version": "v2"}
 
-    HEARTBEAT_INTERVAL = 5 # seconds
+    HEARTBEAT_INTERVAL = 10
     last_heartbeat = time.time()
+    
+    # --- Generate Conversation ID & Save Initial Message --- 
+    conversation_id = str(uuid.uuid4())
+    print(f"[Stream] Starting new conversation with ID: {conversation_id}")
+    initial_user_event = {
+        "conversation_id": conversation_id,
+        "timestamp": datetime.now(timezone.utc).isoformat(),
+        "type": "user_message",
+        "sender": "user",
+        "name": "user_input", # Fixed name for user input
+        "tags": [],
+        "data_json": json.dumps({"content": query})
+    }
+    await save_event_to_weaviate(initial_user_event)
+    print(f"Initial user event saved for conv {conversation_id}")
 
     try:
-        # Use astream_events to get granular start/end events
+        print(f"--- Starting agent event stream for conv {conversation_id} ---")
         async for event in agent_graph.astream_events(initial_state, config=config, **stream_config):
             kind = event["event"]
             name = event.get("name")
-            data = event.get("data", {})
+            event_payload = event.get("data", {}) 
             tags = event.get("tags", [])
-            metadata = event.get("metadata", {})
-            
+            current_timestamp = datetime.now(timezone.utc).isoformat()
+
+            # --- Heartbeat --- 
             current_time = time.time()
             if current_time - last_heartbeat > HEARTBEAT_INTERVAL:
-                 yield json.dumps({"type": "heartbeat", "data": "alive"}) + "\n"
-                 last_heartbeat = current_time
+                yield json.dumps({"type": "heartbeat", "data": "alive"}) + "\n"
+                last_heartbeat = current_time
 
-            # --- Handle Node Start Events (Status Updates) ---
+            # --- Prepare Data for Frontend Yield --- 
+            # Initialize with guaranteed defaults to prevent None values
+            yield_type = "debug" # Default event type
+            yield_data = None    # Default data
+            save_event = False   # Flag indicating whether to save this event
+
+            # --- Determine yield_type and yield_data based on event kind and node --- 
             if kind == "on_chain_start":
+                # Chain start yields a status update
                 status_message = None
                 if name == "plan_step_node": status_message = "Planning research steps..."
-                elif name == "execute_step_node": status_message = "Executing research step..."
+                elif name == "execute_step_node": status_message = f"Executing Step {initial_state.get('current_step_index', 0) + 1}..."
                 elif name == "refine_or_report_node": status_message = "Evaluating results..."
                 elif name == "generate_report_node": status_message = "Generating final report..."
                 elif name == "error_handler_node": status_message = "Handling error..."
                 
                 if status_message:
-                    print(f"[Stream] Yielding: status - {status_message}")
-                    yield json.dumps({"type": "status", "data": status_message}) + "\n"
-                    last_heartbeat = current_time # Reset after yielding
+                    yield_type = "status"  # Status is a valid yield type
+                    yield_data = status_message
+                    save_event = True      # We'll save status events
 
-            # --- Handle Node End Events (Data Updates) ---
             elif kind == "on_chain_end":
-                output_state = data.get("output") 
-                input_state = data.get("input") # Get input state as well
-                
+                # Chain end events contain the actual results
+                output_state = event_payload.get("output")
                 if not isinstance(output_state, dict):
-                    print(f"[Stream] Warning: Node '{name}' output is not a dict: {type(output_state)}. Skipping data yield.")
-                    continue
-                if not isinstance(input_state, dict): # Should also be a dict
-                     input_state = {} # Gracefully handle if missing
-                    
+                    output_state = {} # Ensure output_state is a dict for safety
+
+                # Check for errors first
                 node_error = output_state.get("error")
                 if node_error:
-                    # Error might be handled by error_handler_node, or occurred within another node
-                    print(f"[Stream] Yielding: error - {node_error}")
-                    yield json.dumps({"type": "error", "data": node_error}) + "\n"
-                    # Decide if we should break here or let the graph proceed to the error handler node
-                    # If the error handler node itself ends, it will yield the final error report below.
-                    # Let's not break here to allow the graph's error handling edge to work.
-                    last_heartbeat = current_time
+                    yield_type = "error"
+                    yield_data = node_error
+                    save_event = True
+                else:
+                    # For non-error cases, map to specific yield types based on node name
+                    if name == "plan_step_node":
+                        plan = output_state.get("plan")
+                        if plan is not None:
+                            yield_type = "plan"
+                            yield_data = plan
+                            save_event = True
+                    elif name == "execute_step_node":
+                        step_results = output_state.get("step_results")
+                        finished_step_idx = output_state.get("current_step_index", 0) - 1
+                        if step_results and finished_step_idx >= 0 and len(step_results) > finished_step_idx:
+                            recent_step = step_results[finished_step_idx]
+                            yield_type = "step_result"
+                            yield_data = {
+                                "step_index": finished_step_idx,
+                                "step_name": recent_step.get("step_name", "?"),
+                                "findings_preview": str(recent_step.get("findings", ""))[:500] + "...",
+                                "sources": recent_step.get("sources", [])
+                            }
+                            save_event = True
+                    elif name == "refine_or_report_node":
+                        refinement_needed = output_state.get('refinement_needed')
+                        if refinement_needed is not None:  # Make explicit check for None
+                            status = "Evaluation complete. Refinement needed." if refinement_needed else "Evaluation complete. Proceeding."
+                            yield_type = "evaluation"
+                            yield_data = {"status": status, "refinement_needed": refinement_needed}
+                            save_event = True
+                    elif name == "generate_report_node":
+                        report = output_state.get("report")
+                        if report is not None:
+                            yield_type = "report"
+                            yield_data = report
+                            save_event = True
+                    elif name == "error_handler_node":
+                        # This is redundant with error check above, but for clarity
+                        if node_error:
+                            yield_type = "error"
+                            yield_data = f"Error handled: {node_error}"
+                            save_event = True
+                        else:
+                            # Something went to error handler but no node_error field?
+                            yield_type = "error"
+                            yield_data = "Unknown error occurred in handler"
+                            save_event = True
+                    # else:
+                    #    // Other node types would be handled here
 
-                # Yield specific data based on which node finished
-                if name == "plan_step_node":
-                    plan = output_state.get("plan")
-                    if plan and not node_error and not input_state.get("plan"):
-                        print(f"[Stream] Yielding: plan ({len(plan)} steps) - First Generation")
-                        yield json.dumps({"type": "plan", "data": plan}) + "\n"
-                        last_heartbeat = current_time
-                    elif plan and not node_error and input_state.get("plan"):
-                         print(f"[Stream] Skipping plan yield - Refinement loop.")
-                        
-                elif name == "execute_step_node":
-                    step_results = output_state.get("step_results")
-                    current_idx = output_state.get("current_step_index", 0)
-                    # Yield result for the step that just finished (index is updated *after* execution)
-                    finished_step_idx = current_idx - 1 
-                    if step_results and finished_step_idx >= 0 and len(step_results) > finished_step_idx and not node_error:
-                        recent_step_result = step_results[finished_step_idx]
-                        print(f"[Stream] Yielding: step_result - Index {finished_step_idx}")
-                        # Limit findings preview length for streaming
-                        findings_preview = str(recent_step_result.get("findings", ""))
-                        if len(findings_preview) > 500:
-                            findings_preview = findings_preview[:500] + "..."
-                        step_data = {
-                            "step_index": finished_step_idx,
-                            "step_name": recent_step_result.get("step_name", "?"),
-                            "findings_preview": findings_preview, # Send preview
-                            "sources": recent_step_result.get("sources", [])
-                            # Optionally include tokens: "tokens_before": ..., "tokens_after": ...
-                        }
-                        yield json.dumps({"type": "step_result", "data": step_data}) + "\n"
-                        last_heartbeat = current_time
+            # --- Yield to Frontend --- 
+            # Only yield non-debug events that have data
+            if yield_type != "debug" and yield_data is not None:
+                yield_json = json.dumps({"type": yield_type, "data": yield_data})
+                yield yield_json + "\n"
+                last_heartbeat = time.time() # Reset heartbeat countdown
 
-                elif name == "refine_or_report_node":
-                    # This node evaluates, yield evaluation status
-                    refinement_needed = output_state.get('refinement_needed')
-                    status = "Evaluation complete. Refinement needed." if refinement_needed else "Evaluation complete. Proceeding to report."
-                    print(f"[Stream] Yielding: evaluation - {status}")
-                    yield json.dumps({"type": "evaluation", "data": {"status": status, "refinement_needed": refinement_needed}}) + "\n"
-                    last_heartbeat = current_time
-                    
-                elif name == "generate_report_node":
-                    report = output_state.get("report")
-                    if report and not node_error:
-                        print(f"[Stream] Yielding: report")
-                        yield json.dumps({"type": "report", "data": report}) + "\n"
-                        # Report generation is usually the final step before END
-                        # No need to break, graph flow will handle termination
-                        last_heartbeat = current_time
-                        
-                elif name == "error_handler_node":
-                     # The error handler node might put a formatted error into the 'report' field
-                    error_report = output_state.get("report") 
-                    if error_report:
-                        print(f"[Stream] Yielding: error_report - {error_report}")
-                        yield json.dumps({"type": "error", "data": error_report}) + "\n"
-                    else: # Fallback if error handler didn't produce a report
-                        yield json.dumps({"type": "error", "data": output_state.get("error", "Unhandled error occurred")}) + "\n"
-                    # Error handler leads to END, so graph will terminate.
-                    last_heartbeat = current_time
+            # --- Save Events to Weaviate (Asynchronously) --- 
+            # Save agent_yield if we should and have a valid type and data
+            # print(f"[SAVE_DEBUG] Event type: {yield_type}, Save flag: {save_event}, Node: {name}")
+            if save_event and yield_type != "debug" and yield_data is not None:
+                # Ensure yield_type is a string (defensive programming)
+                agent_yield_name = str(yield_type) if yield_type is not None else "unknown"
+                
+                # Create the agent_yield event (what the frontend receives)
+                agent_yield_event = {
+                    "conversation_id": conversation_id,
+                    "timestamp": current_timestamp,
+                    "type": "agent_yield", 
+                    "sender": "agent", 
+                    "name": agent_yield_name,  # Guaranteed to be a valid string
+                    "tags": tags,
+                    "data_json": safe_serialize(yield_data)
+                }
+                print(f"[SAVE_DEBUG] Saving agent_yield with name='{agent_yield_name}'")
+                asyncio.create_task(save_event_to_weaviate(agent_yield_event))
+
+            # Save agent_internal_state for chain_end events with valid output state
+            if kind == "on_chain_end" and isinstance(event_payload.get("output"), dict):
+                output_state_to_save = event_payload.get("output")
+                # Ensure we have a valid name for the internal state
+                internal_state_name = str(name) if name is not None else "unknown_node"
+                
+                # Create the agent_internal_state event (for potential continuation)
+                internal_state_event = {
+                    "conversation_id": conversation_id,
+                    "timestamp": current_timestamp, 
+                    "type": "agent_internal_state", 
+                    "sender": "agent", 
+                    "name": internal_state_name,  # Always store the node name
+                    "tags": tags,
+                    "data_json": safe_serialize(output_state_to_save)
+                }
+                print(f"[SAVE_DEBUG] Saving agent_internal_state for node='{internal_state_name}'")
+                asyncio.create_task(save_event_to_weaviate(internal_state_event))
 
     except Exception as e:
-        error_message = f"Critical error in agent stream orchestration: {str(e)}"
-        print(f"[Stream] Orchestration Error: {error_message}")
-        try:
-            yield json.dumps({"type": "error", "data": error_message}) + "\n"
-        except Exception as yield_err:
-             print(f"[Stream] Error yielding orchestration error message: {yield_err}")
+        print(f"--- ERROR in agent stream main loop (conv {conversation_id}): {e} ---")
+        traceback.print_exc()
+        error_message = f"Agent stream error: {str(e)}"
+        # Yield error to frontend
+        yield json.dumps({"type": "error", "data": error_message}) + "\n"
+        # Save the critical orchestration error
+        error_event = {
+            "conversation_id": conversation_id,
+            "timestamp": datetime.now(timezone.utc).isoformat(),
+            "type": "orchestration_error",
+            "sender": "system",
+            "name": "stream_loop_exception", # Guaranteed string
+            "tags": [],
+            "data_json": safe_serialize({"message": error_message, "traceback": traceback.format_exc()})
+        }
+        await save_event_to_weaviate(error_event) 
 
     finally:
-        # Optional: Cleanup resources if needed
-        print("--- Research Stream Ended (Finally Block) ---")
-        # Send a final completion message if the stream ends normally
+        print(f"--- Stream ended for conv {conversation_id} ---")
+        final_timestamp = datetime.now(timezone.utc).isoformat()
+        # Yield completion
         yield json.dumps({"type": "complete", "data": "Stream ended"}) + "\n"
+        # Save completion event (as agent_yield with explicit name)
+        complete_event = {
+            "conversation_id": conversation_id,
+            "timestamp": final_timestamp,
+            "type": "agent_yield", 
+            "sender": "agent",
+            "name": "complete",  # This is the correct, explicit value
+            "tags": [],
+            "data_json": safe_serialize("Stream ended")
+        }
+        print(f"[SAVE_DEBUG] Saving final complete event with name='complete'")
+        await save_event_to_weaviate(complete_event)
 
 # --- Example Usage (for testing) ---
 async def main():

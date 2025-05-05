@@ -35,10 +35,10 @@ class Settings(BaseSettings):
     SCRAPE_TIMEOUT: int = int(os.getenv("SCRAPE_TIMEOUT", 10)) # Timeout in seconds for fetching URL content
     USER_AGENT: str = os.getenv("USER_AGENT", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36")
     REPORT_MODE: str = os.getenv("REPORT_MODE", "unified")
-    # --- Vector Store / Memory ---
-    # Configure vector store settings if applicable (e.g., path, collection name)
-    # VECTORSTORE_PATH: str = os.getenv("VECTORSTORE_PATH", "./chroma_db") 
-    # VECTORSTORE_COLLECTION: str = os.getenv("VECTORSTORE_COLLECTION", "research_context")
+    # --- Vector Store / Memory (Weaviate Config) ---
+    WEAVIATE_URL: str = os.getenv("WEAVIATE_URL", "") # e.g., "https://your-cluster-url.weaviate.network"
+    WEAVIATE_API_KEY: str = os.getenv("WEAVIATE_API_KEY", "") # Weaviate Cloud API Key
+    WEAVIATE_HISTORY_CLASS: str = os.getenv("WEAVIATE_HISTORY_CLASS", "ChatHistory")
 
     # --- Reporting ---
     REPORT_FORMAT: str = os.getenv("REPORT_FORMAT", "markdown") # e.g., "markdown", "json"
@@ -63,4 +63,9 @@ settings = Settings()
 # if not settings.TAVILY_API_KEY or "YOUR_" in settings.TAVILY_API_KEY:
 #     print("Warning: TAVILY_API_KEY is not set or is using a placeholder.")
 
-# print(f"Loaded settings: Main Model='{settings.MAIN_MODEL_NAME}', Max Steps='{settings.MAX_STEPS}'") 
+# print(f"Loaded settings: Main Model='{settings.MAIN_MODEL_NAME}', Max Steps='{settings.MAX_STEPS}'")
+
+# --- Validation --- (Optional)
+if not settings.WEAVIATE_URL or not settings.WEAVIATE_API_KEY:
+    print("Warning: WEAVIATE_URL or WEAVIATE_API_KEY is not set in environment/config.")
+    print("Chat history persistence will be disabled.") 

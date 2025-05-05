@@ -2,6 +2,7 @@ fastapi
 uvicorn[standard]
 pydantic
 python-dotenv
+pydantic-settings
 
 # LangChain and related dependencies
 langchain
@@ -12,3 +13,6 @@ tavily-python
 langchainhub # For pulling prompts if needed 
 langchain-google-genai
 beautifulsoup4
+
+# Add Weaviate client
+weaviate-client>=4.0.0,<5.0.0
