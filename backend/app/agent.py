@@ -36,6 +36,9 @@ from .schemas import AgentState, create_initial_state # Import AgentState from s
 from .agents.planner import plan_research
 from .agents.extractor import execute_step
 from .agents.reporter import generate_final_report, evaluate_results
+# Import reflection system
+from .nodes.reflection import reflection_node, should_extend_plan
+from .nodes.plan_extension import plan_extension_node
 # from .memory.compressor import compress_context # Optional: Context compression
 # from .utils.llm_token_estimator import estimate_token_count # For cost estimation
 # Import the Weaviate saving function
@@ -59,7 +62,7 @@ MAX_ITERATIONS = settings.MAX_STEPS
 # MAX_TOOL_CALLS might not be defined; using a default or adding to config
 MAX_TOOL_CALLS = 10 # Example default
 # LANGGRAPH_RECURSION_LIMIT might not be defined; using a default
-LANGGRAPH_RECURSION_LIMIT = 15 # Example default
+LANGGRAPH_RECURSION_LIMIT = 30 # Example default
 
 # --- Tools --- #
 # TODO: Move tool initialization to tools/ directory later
@@ -103,8 +106,31 @@ async def plan_step_node(state: AgentState) -> AgentState:
         # print(f"Current state before planning: {state}")
         result = await plan_research(state)
         # print(f"--- plan_research completed successfully. Result: {result} ---")
+        
+        # --- Initialize step_status if a new plan is created/updated --- 
+        if result.get('plan') and isinstance(result['plan'], list):
+            plan = result['plan']
+            plan_length = len(plan)
+            
+            # Add step numbers to original plan if they don't exist
+            for i, step in enumerate(plan):
+                if 'step' not in step:
+                    step['step'] = i + 1  # Start step numbering from 1
+            
+            # If status is None or length doesn't match, initialize/reset
+            current_step_status = state.get('step_status', {})
+            if not current_step_status or len(current_step_status) != plan_length:
+                # Initialize step_status using step numbers, not array indices
+                result['step_status'] = {step['step']: 'pending' for step in plan}
+                print(f"Initialized step_status dictionary for {plan_length} steps with step numbers.")
+            # If plan changed but length is same, reset pending ones? Or handle granularly? 
+            # For now, only initialize if lengths mismatch or status is None.
+
         # Merge the updates from the planner into the state
-        return {**state, **result}
+        # Make sure to include the potentially updated step_status
+        updated_state = {**state, **result}
+        return updated_state
+        
     except Exception as e:
         # print(f"--- ERROR in plan_step_node: {e} ---")
         traceback.print_exc() # Print full traceback
@@ -113,15 +139,45 @@ async def plan_step_node(state: AgentState) -> AgentState:
 
 async def execute_step_node(state: AgentState) -> AgentState:
     result = await execute_step(state)
+    # Ensure step_status is updated implicitly by should_continue logic later
+    # The executor just returns its findings.
     return {**state, **result}
 
 async def refine_or_report_node(state: AgentState) -> AgentState:
-    result = await evaluate_results(state) # Evaluation decides refinement
-    return {**state, **result}
+    """Legacy evaluation node - now replaced by mandatory reflection workflow."""
+    print("--- Legacy Refine or Report Node (Deprecated) ---")
+    
+    # This node is now deprecated since we have mandatory reflection
+    # Return state unchanged and let should_continue handle routing
+    return state
 
 async def generate_report_node(state: AgentState) -> AgentState:
     result = await generate_final_report(state)
     return {**state, **result}
+
+async def reflection_node_wrapper(state: AgentState) -> AgentState:
+    """Wrapper for the mandatory reflection node."""
+    print("--- Entering reflection_node_wrapper ---")
+    try:
+        result = await reflection_node(state)
+        print(f"--- Reflection completed. Quality score: {result.get('quality_score', 'N/A')} ---")
+        return {**state, **result}
+    except Exception as e:
+        print(f"--- ERROR in reflection_node_wrapper: {e} ---")
+        traceback.print_exc()
+        return {**state, "error": f"Failed during reflection: {str(e)}"}
+
+async def plan_extension_node_wrapper(state: AgentState) -> AgentState:
+    """Wrapper for the plan extension node."""
+    print("--- Entering plan_extension_node_wrapper ---")
+    try:
+        result = await plan_extension_node(state)
+        print(f"--- Plan extension completed. Extended plan length: {len(result.get('plan', []))} ---")
+        return {**state, **result}
+    except Exception as e:
+        print(f"--- ERROR in plan_extension_node_wrapper: {e} ---")
+        traceback.print_exc()
+        return {**state, "error": f"Failed during plan extension: {str(e)}"}
 
 async def handle_error_node(state: AgentState) -> AgentState:
     print(f"--- ERROR HANDLER NODE ---")
@@ -133,77 +189,216 @@ async def handle_error_node(state: AgentState) -> AgentState:
     # We can enhance it later to produce a formatted error report.
     return {**state, "report": f"Agent stopped due to error: {error}"} # Overwrite report with error
 
-# --- Graph Definition --- #
+# --- Graph Definition --- # 
 
 # Conditional edge logic remains similar, checking state fields like 'error', 'iterations', 'refinement_needed' etc.
 def should_continue(state: AgentState) -> str:
-    """Determines the next node after the refine_or_report_node evaluates the state."""
-    iterations = state.get('iterations', 0) + 1 # Increment happens conceptually entering this check
+    """Determines the next node after evaluation, with mandatory reflection workflow."""
+    # NOTE: current_step_index points to the *next* step to be potentially executed (array index)
+    current_index = state.get('current_step_index', 0)
+    plan = state.get('plan')
+    step_status = state.get('step_status', {}).copy()  # Get dictionary and make a copy
+    step_results = state.get('step_results', [])
+    plan_length = len(plan) if plan else 0
+
+    # --- Mark the *just completed* step as 'completed' --- 
+    # The step *before* current_index just finished (unless it's the start)
+    last_completed_index = current_index - 1
+    if last_completed_index >= 0 and last_completed_index < len(plan):
+        last_completed_step = plan[last_completed_index]
+        last_completed_step_number = last_completed_step.get('step', last_completed_index + 1)
+        if last_completed_step_number in step_status and step_status[last_completed_step_number] == 'pending':
+            step_status[last_completed_step_number] = 'completed'
+            state['step_status'] = step_status # Update state immediately
+            print(f"Marked step {last_completed_step_number} (index {last_completed_index}) as completed.")
+
+    # --- Standard Checks (Error, Iterations, Tool Calls) --- 
+    iterations = state.get('iterations', 0)
+    # Increment iterations *after* 
+    # Let's increment it conceptually *entering* this check as before
+    iterations += 1 
     state['iterations'] = iterations # Persist increment
     global_tool_calls = state.get('global_tool_calls', 0)
 
-    print(f"--- Should Continue Check (Iter: {iterations}, Tools: {global_tool_calls}, Refine?: {state.get('refinement_needed')}) --- ")
+    print(f"--- Should Continue Check (Iter: {iterations}, Next Step Idx: {current_index}, Refine?: {state.get('refinement_needed')}) ---")
 
-    if state.get("error"):
+    if state.get("error"): 
         print("Routing to error handler.")
         return "error_handler_node"
 
-    if iterations > MAX_ITERATIONS:
-        print(f"Max iterations ({MAX_ITERATIONS}) reached. Routing to generate report.")
-        return "generate_report_node"
-    if global_tool_calls >= MAX_TOOL_CALLS:
-        print(f"Max global tool calls ({MAX_TOOL_CALLS}) reached. Routing to generate report.")
-        return "generate_report_node"
+    if iterations > settings.MAX_ITERATIONS:
+        print(f"Maximum iterations ({settings.MAX_ITERATIONS}) reached.")
+        # Set completion reason and proceed to mandatory reflection
+        state['completion_reason'] = 'max_iterations'
+        if state.get('reflection_count', 0) == 0:
+            print("Routing to mandatory reflection before final report.")
+            return "reflection_node_wrapper"
+        else:
+            print("Reflection already completed. Routing to generate report.")
+            return "generate_report_node"
 
+    if global_tool_calls > settings.MAX_TOOL_CALLS_GLOBAL:
+        print(f"Global tool call limit ({settings.MAX_TOOL_CALLS_GLOBAL}) exceeded.")
+        # Set completion reason and proceed to mandatory reflection
+        state['completion_reason'] = 'budget_exhausted'
+        if state.get('reflection_count', 0) == 0:
+            print("Routing to mandatory reflection before final report.")
+            return "reflection_node_wrapper"
+        else:
+            print("Reflection already completed. Routing to generate report.")
+            return "generate_report_node"
+
+    # --- Check for Budget Exhaustion in Last Step --- 
+    last_step_index = current_index - 1
+    if last_step_index >= 0 and last_step_index < len(step_results) and step_results[last_step_index].get('budget_exhausted'):
+        print(f"Step {last_step_index} exhausted its tool call budget. Evaluating if refinement needed.")
+        
+        # Only trigger refinement if we already have some results but need more comprehensive data
+        if step_results[last_step_index].get('findings') and not state.get('refinement_needed'):
+            # Note that refinement could be useful (refinement_node will further evaluate)
+            state['budget_limited_results'] = True
+    
+    # --- Refinement Check --- 
     if state.get("refinement_needed"):
         print("Refinement needed. Routing back to planner.")
         # Reset refinement flag before replanning
-        state['refinement_needed'] = False
+        state['refinement_needed'] = False 
+        # Don't reset current_step_index, planner should decide where to restart/insert
         return "plan_step_node"
 
-    # If no refinement needed and limits not hit, proceed based on plan completion
-    plan = state.get('plan')
-    current_index = state.get('current_step_index', 0)
-    if plan and current_index < len(plan):
-        print("Plan steps remaining. Routing to execute next step.")
+    # --- Check if Plan Exists and Steps Remain --- 
+    if not plan or current_index >= plan_length:
+        print("Plan complete or does not exist.")
+        # Set completion reason and proceed to mandatory reflection
+        state['completion_reason'] = 'plan_complete'
+        if state.get('reflection_count', 0) == 0:
+            print("Routing to mandatory reflection before final report.")
+            return "reflection_node_wrapper"
+        else:
+            print("Reflection already completed. Routing to generate report.")
+            return "generate_report_node"
+
+    # --- Step Skipping Logic --- 
+    # Get the current step by array index and extract its step number for status checking
+    current_step = plan[current_index]
+    current_step_number = current_step.get('step', current_index + 1)
+    step_status_value = step_status.get(current_step_number, 'pending')
+    is_next_step_pending = step_status_value == 'pending'
+    
+    # Debug logging for step status
+    print(f"Step {current_step_number} (index {current_index}) status check: {step_status_value} (is_pending: {is_next_step_pending})")
+    print(f"Current step_status dict: {step_status}")
+    
+    if not is_next_step_pending:
+        print(f"Step {current_step_number} is not pending (status: {step_status_value}). Skipping...")
+        # Advance index past the skipped step (this is an array index)
+        state['current_step_index'] = current_index + 1
+        # Recursively call should_continue to check the *next* step after skipping
+        print("Re-evaluating routing after skipping...")
+        return should_continue(state)
+        
+    # --- Default: Execute Next Step --- 
+    if plan and current_index < plan_length and is_next_step_pending:
+        print(f"Plan steps remaining. Routing to execute step {current_step_number} (index {current_index}).")
         return "execute_step_node"
     else:
-        # Plan is complete, and refinement wasn't triggered by evaluation
-        print("Plan complete and results evaluated as sufficient. Routing to generate report.")
+        # Fallback: Should ideally be caught earlier
+        print("Plan complete (fallback check).")
+        # Set completion reason and proceed to mandatory reflection
+        state['completion_reason'] = 'plan_complete'
+        if state.get('reflection_count', 0) == 0:
+            print("Routing to mandatory reflection before final report.")
+            return "reflection_node_wrapper"
+        else:
+            print("Reflection already completed. Routing to generate report.")
+            return "generate_report_node"
+
+def should_continue_after_reflection(state: AgentState) -> str:
+    """Determines the next node after reflection analysis."""
+    
+    print("--- Post-Reflection Decision ---")
+    
+    # Check for errors first
+    if state.get("error"):
+        print("Error detected after reflection. Routing to error handler.")
+        return "error_handler_node"
+    
+    # Check if reflection indicates plan extension is needed and allowed
+    if should_extend_plan(state):
+        print("Plan extension approved. Routing to plan extension.")
+        return "plan_extension_node_wrapper"
+    else:
+        # No extension needed or not allowed - proceed to final report
+        reflection_results = state.get("reflection_results", [])
+        if reflection_results:
+            latest_reflection = reflection_results[-1]
+            quality_score = latest_reflection.get("quality_score", 0)
+            print(f"Plan extension not needed/allowed. Quality score: {quality_score}. Routing to generate report.")
+        else:
+            print("No reflection results found. Routing to generate report.")
+        
+        # Set final completion reason if not already set
+        if not state.get('completion_reason'):
+            state['completion_reason'] = 'quality_met'
+        
         return "generate_report_node"
 
-# Build the graph instance
-workflow = StateGraph(AgentState)
+def should_continue_after_extension(state: AgentState) -> str:
+    """Determines the next node after plan extension."""
+    
+    print("--- Post-Extension Decision ---")
+    
+    # Check for errors first
+    if state.get("error"):
+        print("Error detected after extension. Routing to error handler.")
+        return "error_handler_node"
+    
+    # Check if extension was successful
+    extended_plan = state.get("plan", [])
+    original_plan = state.get("original_plan", [])
+    
+    if len(extended_plan) > len(original_plan):
+        print(f"Plan successfully extended: {len(original_plan)} → {len(extended_plan)} steps.")
+        print("Routing back to execute new steps.")
+        # Reset refinement flag to continue execution
+        state['refinement_needed'] = False
+        return "execute_step_node"
+    else:
+        print("Plan extension did not add new steps. Routing to generate report.")
+        if not state.get('completion_reason'):
+            state['completion_reason'] = 'extension_failed'
+        return "generate_report_node"
 
-# Add nodes using the wrapper functions
-workflow.add_node("plan_step_node", plan_step_node)
-workflow.add_node("execute_step_node", execute_step_node)
-workflow.add_node("refine_or_report_node", refine_or_report_node)
-workflow.add_node("generate_report_node", generate_report_node)
-workflow.add_node("error_handler_node", handle_error_node)
+# Build the graph
+graph = StateGraph(AgentState)
 
-# Define entry point and standard edges
-workflow.set_entry_point("plan_step_node")
-workflow.add_edge("plan_step_node", "execute_step_node")
-workflow.add_edge("execute_step_node", "refine_or_report_node") # Always evaluate after execution
-workflow.add_edge("generate_report_node", END)
-workflow.add_edge("error_handler_node", END)
+# Add nodes
+graph.add_node("plan_step_node", plan_step_node)
+graph.add_node("execute_step_node", execute_step_node)
+graph.add_node("refine_or_report_node", refine_or_report_node)
+graph.add_node("generate_report_node", generate_report_node)
+graph.add_node("error_handler_node", handle_error_node)
+graph.add_node("reflection_node_wrapper", reflection_node_wrapper)
+graph.add_node("plan_extension_node_wrapper", plan_extension_node_wrapper)
 
-# Add conditional edges originating from the evaluation node
-workflow.add_conditional_edges(
-    "refine_or_report_node",
-    should_continue,
-    {
-        "plan_step_node": "plan_step_node",       # Refinement needed
-        "execute_step_node": "execute_step_node",  # Plan steps remain
-        "generate_report_node": "generate_report_node", # Plan complete or limits reached
-        "error_handler_node": "error_handler_node"  # Error detected
-    }
-)
+# Set entry point
+graph.set_entry_point("plan_step_node")
+
+# Add edges for the main workflow
+graph.add_edge("plan_step_node", "execute_step_node")
+graph.add_conditional_edges("execute_step_node", should_continue)
+
+# Add reflection workflow edges
+graph.add_conditional_edges("reflection_node_wrapper", should_continue_after_reflection)
+graph.add_conditional_edges("plan_extension_node_wrapper", should_continue_after_extension)
+
+# Terminal nodes (no outgoing edges)
+graph.add_edge("generate_report_node", END)
+graph.add_edge("error_handler_node", END)
 
 # Compile the graph
-agent_graph = workflow.compile()
-print("--- Agent Graph Compiled Successfully ---")
+agent_graph = graph.compile()
+print("Agent graph compiled successfully with reflection workflow.")
 
 # --- Agent Runner Async Generator (Streamer) --- #
 
@@ -252,7 +447,7 @@ async def stream_agent_research(
             if current_time - last_heartbeat > HEARTBEAT_INTERVAL:
                 yield json.dumps({"type": "heartbeat", "data": "alive"}) + "\n"
                 last_heartbeat = current_time
-
+            
             # --- Prepare Data for Frontend Yield --- 
             # Initialize with guaranteed defaults to prevent None values
             yield_type = "debug" # Default event type
@@ -267,13 +462,15 @@ async def stream_agent_research(
                 elif name == "execute_step_node": status_message = f"Executing Step {initial_state.get('current_step_index', 0) + 1}..."
                 elif name == "refine_or_report_node": status_message = "Evaluating results..."
                 elif name == "generate_report_node": status_message = "Generating final report..."
+                elif name == "reflection_node_wrapper": status_message = "Reflecting on results..."
+                elif name == "plan_extension_node_wrapper": status_message = "Extending research plan..."
                 elif name == "error_handler_node": status_message = "Handling error..."
                 
                 if status_message:
                     yield_type = "status"  # Status is a valid yield type
                     yield_data = status_message
                     save_event = True      # We'll save status events
-
+            
             elif kind == "on_chain_end":
                 # Chain end events contain the actual results
                 output_state = event_payload.get("output")
@@ -290,35 +487,63 @@ async def stream_agent_research(
                     # For non-error cases, map to specific yield types based on node name
                     if name == "plan_step_node":
                         plan = output_state.get("plan")
-                        if plan is not None:
-                            yield_type = "plan"
-                            yield_data = plan
+                        # Get the status initialized by the node itself
+                        status = output_state.get("step_status") 
+                        if plan is not None and status is not None:
+                            yield_type = "plan" # Yield type remains plan
+                            # Yield both plan and status together
+                            yield_data = {"plan": plan, "status": status} 
                             save_event = True
                     elif name == "execute_step_node":
                         step_results = output_state.get("step_results")
-                        finished_step_idx = output_state.get("current_step_index", 0) - 1
+                        # The index of the step that just finished
+                        finished_step_idx = output_state.get("current_step_index", 0) - 1 
                         if step_results and finished_step_idx >= 0 and len(step_results) > finished_step_idx:
                             recent_step = step_results[finished_step_idx]
                             yield_type = "step_result"
                             yield_data = {
                                 "step_index": finished_step_idx,
-                                "step_name": recent_step.get("step_name", "?"),
+                                # Use step_name from the result if available
+                                "step_name": recent_step.get("step_name", f"Step {finished_step_idx + 1}"), 
                                 "findings_preview": str(recent_step.get("findings", ""))[:500] + "...",
                                 "sources": recent_step.get("sources", [])
                             }
                             save_event = True
                     elif name == "refine_or_report_node":
                         refinement_needed = output_state.get('refinement_needed')
+                        # Get current status to potentially yield updates
+                        current_status = output_state.get('step_status')
                         if refinement_needed is not None:  # Make explicit check for None
-                            status = "Evaluation complete. Refinement needed." if refinement_needed else "Evaluation complete. Proceeding."
+                            status_msg = "Evaluation complete. Refinement needed." if refinement_needed else "Evaluation complete. Proceeding."
                             yield_type = "evaluation"
-                            yield_data = {"status": status, "refinement_needed": refinement_needed}
+                            yield_data = {
+                                "status": status_msg, 
+                                "refinement_needed": refinement_needed,
+                                # Optionally include updated step status if evaluation modifies it (e.g., skips)
+                                "step_status_update": current_status 
+                            }
                             save_event = True
                     elif name == "generate_report_node":
                         report = output_state.get("report")
                         if report is not None:
                             yield_type = "report"
                             yield_data = report
+                            save_event = True
+                    elif name == "reflection_node_wrapper":
+                        quality_score = output_state.get('quality_score')
+                        if quality_score is not None:
+                            yield_type = "reflection_result"
+                            yield_data = {
+                                "quality_score": quality_score
+                            }
+                            save_event = True
+                    elif name == "plan_extension_node_wrapper":
+                        extended_plan = output_state.get('plan')
+                        if extended_plan is not None:
+                            yield_type = "plan_extension_result"
+                            yield_data = {
+                                "extended_plan": extended_plan
+                            }
                             save_event = True
                     elif name == "error_handler_node":
                         # This is redundant with error check above, but for clarity
@@ -379,7 +604,7 @@ async def stream_agent_research(
                 }
                 print(f"[SAVE_DEBUG] Saving agent_internal_state for node='{internal_state_name}'")
                 asyncio.create_task(save_event_to_weaviate(internal_state_event))
-
+    
     except Exception as e:
         print(f"--- ERROR in agent stream main loop (conv {conversation_id}): {e} ---")
         traceback.print_exc()

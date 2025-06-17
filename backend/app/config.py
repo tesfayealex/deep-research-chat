@@ -11,25 +11,28 @@ class Settings(BaseSettings):
     OPENAI_API_KEY: str = os.getenv("OPENAI_API_KEY", "YOUR_OPENAI_API_KEY_HERE")
     TAVILY_API_KEY: str = os.getenv("TAVILY_API_KEY", "YOUR_TAVILY_API_KEY_HERE") 
     GOOGLE_API_KEY: str = os.getenv("GOOGLE_API_KEY", "YOUR_GOOGLE_API_KEY_HERE")
+    ANTHROPIC_API_KEY: str = os.getenv("ANTHROPIC_API_KEY", "YOUR_ANTHROPIC_API_KEY_HERE")
     # Add other API keys as needed (e.g., Anthropic)
     # ANTHROPIC_API_KEY: str = os.getenv("ANTHROPIC_API_KEY", "YOUR_ANTHROPIC_API_KEY_HERE")
 
     # --- Model Selection ---
     # Specify the main LLM and embedding model names
     # Examples: "gpt-4o", "gpt-3.5-turbo", "claude-3-opus-20240229", "text-embedding-3-small"
-    MAIN_MODEL_NAME: str = os.getenv("MAIN_MODEL_NAME", "gpt-4o") 
+    MAIN_MODEL_NAME: str = os.getenv("MAIN_MODEL_NAME", "gpt-4o-mini") 
     EMBEDDING_MODEL_NAME: str = os.getenv("EMBEDDING_MODEL_NAME", "text-embedding-3-small")
     # Optionally specify a separate, potentially faster/cheaper model for specific tasks
     FAST_MODEL_NAME: str = os.getenv("FAST_MODEL_NAME", MAIN_MODEL_NAME) # Default to main model
+    EXTRACTION_MODEL_NAME: str = os.getenv("EXTRACTION_MODEL_NAME", "gpt-4o-mini")
 
     # --- Agent Configuration ---
-    MAX_STEPS: int = int(os.getenv("MAX_STEPS", 5)) # Maximum planning steps
+    MAX_STEPS: int = int(os.getenv("MAX_STEPS", "10")) # Maximum planning steps
     MAX_SEARCH_RESULTS_PER_STEP: int = int(os.getenv("MAX_SEARCH_RESULTS_PER_STEP", 3))
-    MAX_TOOL_CALLS_PER_STEP: int = int(os.getenv("MAX_TOOL_CALLS_PER_STEP", 3))
-    TAVILY_MAX_RESULTS: int = int(os.getenv("TAVILY_MAX_RESULTS", 3))
+    MAX_TOOL_CALLS_PER_STEP: int = int(os.getenv("MAX_TOOL_CALLS_PER_STEP", "5"))
+    TAVILY_MAX_RESULTS: int = int(os.getenv("TAVILY_MAX_RESULTS", "5"))
     MAX_URLS_TO_SCRAPE: int = int(os.getenv("MAX_URLS_TO_SCRAPE", 3)) # Max URLs to fetch per extraction step
-    EXTRACTION_MODEL_NAME: str = os.getenv("EXTRACTION_MODEL_NAME", "gpt-4o")
     MAX_TOTAL_REQUEST_TOKENS: int = int(os.getenv("MAX_TOTAL_REQUEST_TOKENS", 4000)) # Safety limit for LLM input tokens
+    MAX_STEP_REPETITIONS: int = int(os.getenv("MAX_STEP_REPETITIONS", "2")) # Max internal retries/refinements within executor step
+    SEARCH_METHOD: str = os.getenv("SEARCH_METHOD", "direct")  # "subquery" or "direct"
 
     # --- URL Extraction / Scraping ---
     SCRAPE_TIMEOUT: int = int(os.getenv("SCRAPE_TIMEOUT", 10)) # Timeout in seconds for fetching URL content
@@ -39,9 +42,20 @@ class Settings(BaseSettings):
     WEAVIATE_URL: str = os.getenv("WEAVIATE_URL", "") # e.g., "https://your-cluster-url.weaviate.network"
     WEAVIATE_API_KEY: str = os.getenv("WEAVIATE_API_KEY", "") # Weaviate Cloud API Key
     WEAVIATE_HISTORY_CLASS: str = os.getenv("WEAVIATE_HISTORY_CLASS", "ChatHistory")
+    MAX_ITERATIONS: int = int(os.getenv("MAX_ITERATIONS", 3))
+    GEMINI_API_KEY: str = os.getenv("GEMINI_API_KEY", "YOUR_GEMINI_API_KEY_HERE")
+
+    # --- Reflection Configuration ---
+    MIN_CALLS_FOR_EXTENSION: int = int(os.getenv("MIN_CALLS_FOR_EXTENSION", 3))  # Minimum calls needed to justify extension
+    QUALITY_THRESHOLD: int = int(os.getenv("QUALITY_THRESHOLD", 70))  # Quality score threshold for completion
+    MAX_REFLECTION_EXTENSIONS: int = int(os.getenv("MAX_REFLECTION_EXTENSIONS", 2))  # Max times we can extend after reflection
+    REFLECTION_MODEL_NAME: str = os.getenv("REFLECTION_MODEL_NAME", MAIN_MODEL_NAME)  # Model for reflection (can be cheaper)
+    ENABLE_MANDATORY_REFLECTION: bool = os.getenv("ENABLE_MANDATORY_REFLECTION", "true").lower() == "true"  # Toggle reflection
+    MAX_TOOL_CALLS_GLOBAL: int = int(os.getenv("MAX_TOOL_CALLS_GLOBAL", 30))  # Global tool call limit
 
     # --- Reporting ---
     REPORT_FORMAT: str = os.getenv("REPORT_FORMAT", "markdown") # e.g., "markdown", "json"
+    REPORT_MODEL_NAME: str = os.getenv("REPORT_MODEL_NAME", MAIN_MODEL_NAME)  # Model for report generation
     
     # --- Logging ---
     LOG_LEVEL: str = os.getenv("LOG_LEVEL", "INFO").upper()

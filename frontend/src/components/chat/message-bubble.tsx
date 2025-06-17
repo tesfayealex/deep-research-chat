@@ -14,12 +14,18 @@ interface MessageBubbleProps {
 
 // Renders the Plan (used in streaming and final view)
 const RenderPlanContent: React.FC<{ plan: Message['plan'] }> = ({ plan }) => {
-  if (!plan || plan.length === 0) return null;
+  if (!plan) return null;
+  
+  // Ensure plan is an array before mapping
+  const planArray = Array.isArray(plan) ? plan : [];
+  
+  if (planArray.length === 0) return null;
+  
   return (
     <div className="space-y-1.5 mt-2">
       <h4 className="font-semibold text-foreground text-xs">Research Plan</h4>
       <ul className="list-none space-y-1.5 pl-1 text-muted-foreground">
-        {plan.map((step, index) => (
+        {planArray.map((step, index) => (
           <li key={index} className="flex items-start gap-2">
             <span className="font-medium text-foreground w-5 text-right">{index + 1}.</span>
             <div>
@@ -36,6 +42,17 @@ const RenderPlanContent: React.FC<{ plan: Message['plan'] }> = ({ plan }) => {
 // Renders Executed Steps (used in streaming and final view)
 const RenderStepsContent: React.FC<{ steps: StepResult[] }> = ({ steps }) => {
    if (!steps || steps.length === 0) return null;
+
+   // Helper function to check if a string is a valid URL
+   const isValidUrl = (string: string): boolean => {
+     try {
+       new URL(string);
+       return true;
+     } catch (_) {
+       return false;  
+     }
+   };
+
    return (
       <div className="space-y-1.5 mt-2">
           <h4 className="font-semibold text-foreground text-xs">Research Steps Executed</h4>
@@ -54,18 +71,34 @@ const RenderStepsContent: React.FC<{ steps: StepResult[] }> = ({ steps }) => {
                 {step.sources && step.sources.length > 0 && (
                   <div className="flex flex-wrap items-center gap-x-2 gap-y-1 pt-1">
                     <span className="text-xs font-medium text-foreground">Sources:</span>
-                    {step.sources.map((source, srcIndex) => (
-                      <a 
-                        key={srcIndex} 
-                        href={source} 
-                        target="_blank" 
-                        rel="noopener noreferrer"
-                        className="inline-flex items-center gap-1 text-xs text-blue-500 hover:text-blue-600 dark:text-blue-400 dark:hover:text-blue-500 underline truncate max-w-[200px]"
-                      >
-                        <LinkIcon size={12} />
-                        <span>{new URL(source).hostname}</span> 
-                      </a>
-                    ))}
+                    {step.sources.map((source, srcIndex) => {
+                      if (isValidUrl(source)) {
+                        // If it's a valid URL, render the link
+                        return (
+                          <a 
+                            key={srcIndex} 
+                            href={source} 
+                            target="_blank" 
+                            rel="noopener noreferrer"
+                            className="inline-flex items-center gap-1 text-xs text-blue-500 hover:text-blue-600 dark:text-blue-400 dark:hover:text-blue-500 underline truncate max-w-[200px]"
+                          >
+                            <LinkIcon size={12} />
+                            <span>{new URL(source).hostname}</span> 
+                          </a>
+                        );
+                      } else {
+                        // If it's not a valid URL, render as plain text
+                        return (
+                          <span 
+                            key={srcIndex} 
+                            className="text-xs text-muted-foreground truncate max-w-[200px]"
+                            title={source} // Show full text on hover
+                          >
+                            {source} 
+                          </span>
+                        );
+                      }
+                    })}
                   </div>
                 )}
               </div>
@@ -134,8 +167,8 @@ export default function MessageBubble({ message }: MessageBubbleProps) {
               </div>
             )}
 
-            {/* Render Plan using helper during streaming */} 
-            <RenderPlanContent plan={message.plan} />
+            {/* We're removing this redundant plan display from the streaming UI, it's still in thinking */}
+            {/* The plan will only be visible within the thinking accordion */}
 
             {/* Render accumulating steps during streaming using helper */} 
             <RenderStepsContent steps={message.thinking || []} /> 

@@ -82,8 +82,8 @@ export function Sidebar({
                       transform transition-transform duration-200 ease-in-out
                       w-64 h-full border-r bg-background flex flex-col
                       md:translate-x-0 fixed md:relative z-40`}>
-        {/* New Chat Button */}
-        <div className="p-4 border-b">
+        {/* New Chat Button - Keep fixed at top */}
+        <div className="p-4 border-b sticky top-0 bg-background z-10">
           <Button 
             variant="default" 
             className="w-full justify-start text-left"
@@ -94,31 +94,33 @@ export function Sidebar({
           </Button>
         </div>
         
-        {/* Chat History */}
-        <ScrollArea className="flex-1 p-2">
-          {loading ? (
-            <div className="text-center py-4 text-sm text-muted-foreground">Loading conversations...</div>
-          ) : conversations.length === 0 ? (
-            <div className="text-center py-4 text-sm text-muted-foreground">No conversations yet</div>
-          ) : (
-            <div className="space-y-1">
-              {conversations.map((convo) => (
-                <Button
-                  key={convo.id}
-                  variant={selectedConversationId === convo.id ? "secondary" : "ghost"}
-                  className="w-full justify-start text-left h-auto py-2 px-3"
-                  onClick={() => onSelectConversation(convo.id)}
-                >
-                  <div className="flex flex-col">
-                    <span className="line-clamp-1 font-medium">{convo.title}</span>
-                    <span className="text-xs text-muted-foreground">
-                      {formatDate(convo.timestamp)}
-                    </span>
-                  </div>
-                </Button>
-              ))}
-            </div>
-          )}
+        {/* Chat History - Make sure it's scrollable and doesn't push the button */}
+        <ScrollArea className="flex-1 overflow-y-auto">
+          <div className="p-2">
+            {loading ? (
+              <div className="text-center py-4 text-sm text-muted-foreground">Loading conversations...</div>
+            ) : conversations.length === 0 ? (
+              <div className="text-center py-4 text-sm text-muted-foreground">No conversations yet</div>
+            ) : (
+              <div className="space-y-1">
+                {conversations.map((convo) => (
+                  <Button
+                    key={convo.id}
+                    variant={selectedConversationId === convo.id ? "secondary" : "ghost"}
+                    className="w-full justify-start text-left h-auto py-2 px-3"
+                    onClick={() => onSelectConversation(convo.id)}
+                  >
+                    <div className="flex flex-col">
+                      <span className="line-clamp-1 font-medium">{convo.title}</span>
+                      <span className="text-xs text-muted-foreground">
+                        {formatDate(convo.timestamp)}
+                      </span>
+                    </div>
+                  </Button>
+                ))}
+              </div>
+            )}
+          </div>
         </ScrollArea>
       </div>
     </>

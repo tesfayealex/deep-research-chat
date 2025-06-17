@@ -1,9 +1,10 @@
 'use client';
 import { ChatLayout } from "@/components/chat/chat-layout";
-import React, { useEffect } from 'react';
+import React, { useEffect, useCallback, useState } from 'react';
 
 export default function Home() {
-  const [selectedConversationId, setSelectedConversationId] = React.useState<string | null>(null);
+  const [selectedConversationId, setSelectedConversationId] = useState<string | null>(null);
+  const [resetTrigger, setResetTrigger] = useState<number>(0); // Add a reset trigger to force reset
   
   // Check URL for conversation parameter on initial load and popstate events
   useEffect(() => {
@@ -25,17 +26,28 @@ export default function Home() {
     };
   }, []);
   
-  const onNewChat = () => {
-    // Clear the conversation ID
+  // Use useCallback to ensure the function is stable between renders
+  const onNewChat = useCallback(() => {
+    // Force a complete reset of the chat state
     setSelectedConversationId(null);
+    
+    // Add a reset trigger increment to force component reset
+    setResetTrigger(prev => prev + 1);
     
     // Update the URL to remove the conversation parameter
     window.history.pushState({}, '', '/');
-  };
+    
+    // Additional debugging if needed
+    console.log('Starting new chat, reset triggered');
+  }, []);
   
   return (
     <main className="min-h-screen">
-      <ChatLayout selectedConversationId={selectedConversationId} onNewChat={onNewChat} />
+      <ChatLayout 
+        key={`chat-${resetTrigger}`} // Force remount on reset
+        selectedConversationId={selectedConversationId} 
+        onNewChat={onNewChat} 
+      />
     </main>
   );
 }

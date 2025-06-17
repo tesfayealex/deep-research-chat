@@ -5,6 +5,8 @@ import ChatMessages from './chat-messages';
 import ChatInput from './chat-input';
 import { v4 as uuidv4 } from 'uuid'; // For generating unique message IDs
 import { Sidebar } from './sidebar';
+import { Button } from '@/components/ui/button';
+import { ScrollArea } from '@/components/ui/scroll-area';
 
 // Define StepResult type (matches backend step_result data)
 export interface StepResult {
@@ -21,7 +23,7 @@ export interface Message {
   sender: 'user' | 'agent';
   text?: string; // Optional: Used for user messages, final report, status, error
   isStreaming?: boolean;
-  plan?: { step_name: string; step_detail: string }[]; // Used by plan yields
+  plan?: { step_name: string; step_detail: string }[]; // Plan array ONLY
   status?: string; // Used by status/evaluation yields
   thinking?: StepResult[]; // Accumulates step_result yields
   // Add field to store original event type for debugging/styling
@@ -51,6 +53,10 @@ export function ChatLayout({ selectedConversationId, onNewChat }: ChatLayoutProp
   const [isLoading, setIsLoading] = useState(false);
   const streamingMessageRef = useRef<Message | null>(null);
   const backendUrl = process.env.NEXT_PUBLIC_BACKEND_API_URL || 'http://localhost:8000';
+  const [currentThinkingSteps, setCurrentThinkingSteps] = useState<StepResult[]>([]); // Use StepResult type
+  const [plan, setPlan] = useState<any[] | null>(null); // This seems redundant if plan is on the message?
+  const [stepStatuses, setStepStatuses] = useState<string[]>([]); // Tracks live statuses
+  const chatContainerRef = useRef<HTMLDivElement>(null);
 
   // Function to format history events into Message objects for UI
   const formatHistoryEvent = (event: HistoryEvent): Message | null => {
@@ -76,7 +82,17 @@ export function ChatLayout({ selectedConversationId, onNewChat }: ChatLayoutProp
         const yieldName = event.name;
         switch (yieldName) {
           case 'plan':
-            return { ...baseMessage, plan: data, status: 'Plan Received' } as Message;
+            // Check if data is formatted as {plan: [...], status: [...]}
+            if (data && data.plan && Array.isArray(data.plan)) {
+              // Extract just the plan array for the message
+              return { ...baseMessage, plan: data.plan, status: 'Plan Received' } as Message;
+            } else if (Array.isArray(data)) {
+              // For backward compatibility with older history records
+              return { ...baseMessage, plan: data, status: 'Plan Received' } as Message;
+            } else {
+              console.warn("Invalid plan format in history:", data);
+              return { ...baseMessage, status: 'Invalid Plan Format' } as Message;
+            }
           case 'step_result':
             // For history, store the step result in the 'thinking' array
             // Create a message per step for simplicity in history view
@@ -136,6 +152,7 @@ export function ChatLayout({ selectedConversationId, onNewChat }: ChatLayoutProp
     console.log("Loading history for:", convId);
     setIsLoading(true);
     setMessages([]); // Clear existing messages
+    setStepStatuses([]); // Clear statuses when loading history
     try {
       const response = await fetch(`${backendUrl}/api/history/${convId}`);
       if (!response.ok) {
@@ -147,7 +164,8 @@ export function ChatLayout({ selectedConversationId, onNewChat }: ChatLayoutProp
       const userMessages: Message[] = [];
       const agentResponses: Message[] = [];
       const stepResultsByTurn: Map<number, StepResult[]> = new Map(); 
-      const plansByTurn: Map<number, any> = new Map();
+      const plansByTurn: Map<number, any> = new Map(); // Store the full plan object {plan, status}
+      const statusByTurn: Map<number, string[]> = new Map(); // Store status array per turn
       
       let currentTurn = -1; // Increments with each user message
       
@@ -157,17 +175,39 @@ export function ChatLayout({ selectedConversationId, onNewChat }: ChatLayoutProp
           currentTurn++;
           try {
             const data = JSON.parse(event.data_json);
+            // Create a proper user message with the content field
             userMessages.push({
               id: `${event.conversation_id}-${event.timestamp}-user-${currentTurn}`,
               sender: 'user',
-              text: data.content || 'User message error',
+              text: data.content, // Make sure we're extracting the 'content' field correctly
               originalEventType: event.type,
             });
+            
+            // Log the user message for debugging
+            console.log(`Processed user message for turn ${currentTurn}:`, data.content);
+            
             // Initialize storage for this turn
             stepResultsByTurn.set(currentTurn, []);
-          } catch (e) {
-            console.error("Error parsing user message:", e);
-          }
+          } catch (e) { 
+            console.error("Error parsing user message:", e, "Raw data:", event.data_json);
+            // Attempt fallback processing if standard parsing fails
+            try {
+              // If data_json might be a string directly
+              const content = typeof event.data_json === 'string' 
+                ? (event.data_json.startsWith('"') ? JSON.parse(event.data_json) : event.data_json)
+                : 'User message (format error)';
+                
+              userMessages.push({
+                id: `${event.conversation_id}-${event.timestamp}-user-${currentTurn}`,
+                sender: 'user',
+                text: content,
+                originalEventType: event.type,
+              });
+              stepResultsByTurn.set(currentTurn, []);
+            } catch (fallbackError) {
+              console.error("Fallback parsing also failed:", fallbackError);
+            }
+          } 
         }
       });
       
@@ -189,13 +229,19 @@ export function ChatLayout({ selectedConversationId, onNewChat }: ChatLayoutProp
               case 'step_result':
                 // Add to step results for current turn
                 const stepResults = stepResultsByTurn.get(currentTurn) || [];
-                stepResults.push(data);
-                stepResultsByTurn.set(currentTurn, stepResults);
+                // Ensure data is a StepResult before pushing
+                if (typeof data === 'object' && data !== null && typeof data.step_index === 'number') {
+                    stepResults.push(data as StepResult);
+                    stepResultsByTurn.set(currentTurn, stepResults);
+                }
                 break;
                 
               case 'plan':
-                // Store plan for current turn
-                plansByTurn.set(currentTurn, data);
+                // Store plan object {plan, status} for current turn
+                if (data && data.plan && data.status) {
+                  plansByTurn.set(currentTurn, data.plan);
+                  statusByTurn.set(currentTurn, data.status);
+                }
                 break;
                 
               case 'report':
@@ -203,15 +249,17 @@ export function ChatLayout({ selectedConversationId, onNewChat }: ChatLayoutProp
                 const agentResponse: Message = {
                   id: `${event.conversation_id}-${event.timestamp}-agent-${currentTurn}`,
                   sender: 'agent',
-                  text: data, // Report content is the main text
+                  text: typeof data === 'string' ? data : JSON.stringify(data), // Report content is the main text
                   originalEventType: event.type,
                   originalEventName: yieldName,
                 };
                 
-                // Add plan if exists for this turn
-                const plan = plansByTurn.get(currentTurn);
-                if (plan) {
-                  agentResponse.plan = plan;
+                // Add plan *array* if exists for this turn
+                const turnPlanArray = plansByTurn.get(currentTurn);
+                if (turnPlanArray) {
+                  agentResponse.plan = turnPlanArray;
+                  // Set status state if needed (though history view might not need live status)
+                  // setStepStatuses(statusByTurn.get(currentTurn) || []);
                 }
                 
                 // Add thinking (step results) if any
@@ -248,6 +296,7 @@ export function ChatLayout({ selectedConversationId, onNewChat }: ChatLayoutProp
       
     } catch (error) {
       console.error("Error loading history:", error);
+      console.error(`Failed to load conversation history: ${error}`);
       setMessages([{ id: uuidv4(), sender: 'agent', text: 'Error loading conversation history.'}]);
     } finally {
       setIsLoading(false);
@@ -261,6 +310,7 @@ export function ChatLayout({ selectedConversationId, onNewChat }: ChatLayoutProp
     } else {
       if (messages.length > 0) { // Check if messages exist before clearing
          setMessages([]);
+         setStepStatuses([]); // Clear statuses for new chat
       }
     }
   }, [selectedConversationId, loadHistory]); 
@@ -273,6 +323,9 @@ export function ChatLayout({ selectedConversationId, onNewChat }: ChatLayoutProp
       onNewChat(); // Call the function to clear selection in parent
       // Reset local state immediately for UI responsiveness
       setMessages([]);
+      setPlan(null); // Reset live plan state
+      setStepStatuses([]); // Reset statuses
+      setCurrentThinkingSteps([]); // Reset thinking
       currentConversationId = null; // Ensure we don't use the old ID
       // Wait briefly for state updates if necessary
       // await new Promise(resolve => setTimeout(resolve, 50)); 
@@ -285,6 +338,9 @@ export function ChatLayout({ selectedConversationId, onNewChat }: ChatLayoutProp
     };
     setMessages(prev => [...prev, userMessage]);
     setIsLoading(true);
+    setStepStatuses([]); // Clear statuses for new query
+    setPlan(null); // Clear plan state
+    setCurrentThinkingSteps([]); // Clear thinking state
 
     // Create a placeholder for the agent's response
     const agentMessageId = uuidv4();
@@ -294,7 +350,7 @@ export function ChatLayout({ selectedConversationId, onNewChat }: ChatLayoutProp
         text: '', 
         isStreaming: true,
         status: 'Connecting...',
-        plan: [], 
+        plan: [], // Initialize plan as empty array
         thinking: [],
     };
     setMessages(prev => [...prev, initialAgentMessage]);
@@ -347,33 +403,49 @@ export function ChatLayout({ selectedConversationId, onNewChat }: ChatLayoutProp
                         const updatedMsg = { ...msg };
                         switch (update.type) {
                             case 'status':
-                                updatedMsg.status = update.data;
+                            updatedMsg.status = update.data;
                                 break;
                             case 'plan':
-                                updatedMsg.plan = update.data;
+                                // Extract plan array and status array separately
+                                updatedMsg.plan = update.data?.plan || []; 
+                                const newStatuses = update.data?.status || [];
+                                setStepStatuses(newStatuses); // Update separate status state
                                 updatedMsg.status = 'Executing plan...';
                                 break;
                             case 'step_result':
-                                updatedMsg.thinking = updatedMsg.thinking || [];
+                            updatedMsg.thinking = updatedMsg.thinking || [];
                                 // Avoid duplicates if stream sends same step multiple times
-                                if (!updatedMsg.thinking.some(t => t.step_index === update.data.step_index)) {
-                                    updatedMsg.thinking.push(update.data);
+                                // Fix linter error: Add type annotation for 't'
+                                if (!updatedMsg.thinking.some((t: StepResult) => t.step_index === update.data.step_index)) {
+                                    // Ensure data is StepResult before pushing
+                                    if (typeof update.data === 'object' && update.data !== null && typeof update.data.step_index === 'number') {
+                                       updatedMsg.thinking.push(update.data as StepResult);
+                                    }
                                 }
-                                updatedMsg.status = `Executing Step ${update.data.step_index + 2}...`;
+                                // Update status based on *current* step statuses state
+                                const currentStatuses = stepStatuses;
+                                const nextPendingIndex = currentStatuses.findIndex(s => s === 'pending');
+                                updatedMsg.status = nextPendingIndex !== -1 
+                                    ? `Executing Step ${nextPendingIndex + 1}...` 
+                                    : (currentStatuses.every(s => s !== 'pending') ? 'Processing final steps...' : 'Executing steps...');
                                 break;
                             case 'evaluation':
                                 updatedMsg.status = update.data.status;
+                                // Update status state if evaluation modifies it
+                                if (update.data?.step_status_update) {
+                                    setStepStatuses(update.data.step_status_update);
+                                }
                                 break;
                             case 'report':
-                                updatedMsg.text = update.data; // Final report content
-                                updatedMsg.status = 'Finished';
+                            updatedMsg.text = update.data; // Final report content
+                            updatedMsg.status = 'Finished';
                                 updatedMsg.isStreaming = false;
                                 updatedMsg.thinking = updatedMsg.thinking || [];
                                 break;
                             case 'error':
-                                updatedMsg.text = `Error: ${update.data}`;
-                                updatedMsg.status = 'Error';
-                                updatedMsg.isStreaming = false;
+                            updatedMsg.text = `Error: ${update.data}`;
+                            updatedMsg.status = 'Error';
+                            updatedMsg.isStreaming = false;
                                 break;
                             case 'complete':
                                 updatedMsg.isStreaming = false;
@@ -420,7 +492,7 @@ export function ChatLayout({ selectedConversationId, onNewChat }: ChatLayoutProp
         }
     }
   };
-  
+
   // handleSelectConversation (remains the same)
   const handleSelectConversation = (conversationId: string) => {
     if (selectedConversationId === conversationId) return;
@@ -429,19 +501,32 @@ export function ChatLayout({ selectedConversationId, onNewChat }: ChatLayoutProp
     window.dispatchEvent(event);
   };
 
+  // Scroll to bottom effect
+  useEffect(() => {
+    if (chatContainerRef.current) {
+      chatContainerRef.current.scrollTop = chatContainerRef.current.scrollHeight;
+    }
+  }, [messages, currentThinkingSteps]); // Trigger scroll on new messages or thinking steps
+
   return (
-    <div className="flex h-screen w-full bg-background overflow-hidden">
+    <div className="flex h-screen overflow-hidden relative">
       <Sidebar 
         selectedConversationId={selectedConversationId}
         onSelectConversation={handleSelectConversation}
         onNewChat={onNewChat}
       />
-      <div className="flex flex-col flex-1 h-full overflow-hidden">
-        <div className="flex-1 overflow-hidden">
-          <ChatMessages messages={messages} />
-        </div>
-        <div className="border-t bg-background p-4">
-          <ChatInput onSendMessage={handleSendMessage} isLoading={isLoading} />
+      
+      {/* Main chat area - use flex-col and make sure each section has appropriate sizing */}
+      <div className="flex-1 flex flex-col h-full overflow-hidden relative">
+        {/* Messages area - flex-1 to take available space */}
+      <ChatMessages messages={messages} />
+
+        {/* Input area - fixed height and anchored to bottom */}
+        <div className="border-t bg-background py-4 px-6 w-full relative">
+          <ChatInput 
+            onSendMessage={handleSendMessage} 
+            isLoading={isLoading}
+          />
         </div>
       </div>
     </div>
