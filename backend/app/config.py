@@ -23,6 +23,7 @@ class Settings(BaseSettings):
     # Optionally specify a separate, potentially faster/cheaper model for specific tasks
     FAST_MODEL_NAME: str = os.getenv("FAST_MODEL_NAME", MAIN_MODEL_NAME) # Default to main model
     EXTRACTION_MODEL_NAME: str = os.getenv("EXTRACTION_MODEL_NAME", "gpt-4o-mini")
+    PLAN_EXTENSION_MODEL_NAME: str = os.getenv("PLAN_EXTENSION_MODEL_NAME", MAIN_MODEL_NAME)  # Model for plan extension
 
     # --- Agent Configuration ---
     MAX_STEPS: int = int(os.getenv("MAX_STEPS", "10")) # Maximum planning steps
@@ -32,7 +33,7 @@ class Settings(BaseSettings):
     MAX_URLS_TO_SCRAPE: int = int(os.getenv("MAX_URLS_TO_SCRAPE", 3)) # Max URLs to fetch per extraction step
     MAX_TOTAL_REQUEST_TOKENS: int = int(os.getenv("MAX_TOTAL_REQUEST_TOKENS", 4000)) # Safety limit for LLM input tokens
     MAX_STEP_REPETITIONS: int = int(os.getenv("MAX_STEP_REPETITIONS", "2")) # Max internal retries/refinements within executor step
-    SEARCH_METHOD: str = os.getenv("SEARCH_METHOD", "direct")  # "subquery" or "direct"
+    SEARCH_METHOD: str = os.getenv("SEARCH_METHOD", "subquery")  # "subquery" or "direct"
 
     # --- URL Extraction / Scraping ---
     SCRAPE_TIMEOUT: int = int(os.getenv("SCRAPE_TIMEOUT", 10)) # Timeout in seconds for fetching URL content

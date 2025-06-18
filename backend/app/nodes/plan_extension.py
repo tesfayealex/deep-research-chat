@@ -8,10 +8,10 @@ import json
 import logging
 from typing import Dict, List, Any
 from langchain_core.messages import HumanMessage, SystemMessage
-from langchain_openai import ChatOpenAI
 
 from ..schemas import AgentState
 from ..config import settings
+from ..models.model_factory import get_plan_extension_model
 
 # Set up logging
 logger = logging.getLogger(__name__)
@@ -35,6 +35,10 @@ async def plan_extension_node(state: AgentState) -> Dict[str, Any]:
     """
     logger.info("📋 Starting plan extension based on reflection analysis...")
     
+    # Determine which model is being used for plan extension
+    plan_extension_model_name = getattr(settings, 'PLAN_EXTENSION_MODEL_NAME', settings.MAIN_MODEL_NAME)
+    print(f"Using plan extension model: {plan_extension_model_name}")
+    
     try:
         # Get reflection results
         reflection_results = state.get("reflection_results", [])
@@ -50,11 +54,9 @@ async def plan_extension_node(state: AgentState) -> Dict[str, Any]:
             logger.info("ℹ️ No knowledge gaps or proposed steps - plan extension not needed")
             return {"refinement_needed": False}
         
-        # Initialize extension model
-        extension_model = ChatOpenAI(
-            model=settings.MAIN_MODEL_NAME,
-            temperature=0.3,  # Slightly higher temperature for creative planning
-            api_key=settings.OPENAI_API_KEY
+        # Initialize extension model using model factory
+        extension_model = get_plan_extension_model(
+            temperature=0.3  # Slightly higher temperature for creative planning
         )
         
         # Create extension prompt

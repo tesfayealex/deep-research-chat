@@ -87,7 +87,7 @@ async def execute_step(state: AgentState) -> Dict:
         
         try:
             # Perform single comprehensive search
-            search_result = await perform_web_search(step_detail)
+            search_result = await perform_web_search(step_detail, None,state.get('current_step_index', 0))
             step_tool_calls += 1
             global_tool_calls += 1
             
@@ -174,7 +174,7 @@ async def execute_step(state: AgentState) -> Dict:
             attempted_queries.append(clean_query)
             
             try:
-                search_result = await perform_web_search(clean_query)
+                search_result = await perform_web_search(clean_query, None, state.get('current_step_index', 0))
                 step_tool_calls += 1
                 global_tool_calls += 1
                 
@@ -202,7 +202,7 @@ async def execute_step(state: AgentState) -> Dict:
                 refined_query = refine_failed_query(failed_query) # Use simple refinement
                 print(f"Retrying {i+1}/{retry_budget} with: '{refined_query}'")
                 try:
-                    search_result = await perform_web_search(refined_query)
+                    search_result = await perform_web_search(refined_query, None, state.get('current_step_index', 0))
                     step_tool_calls += 1
                     global_tool_calls += 1
                     if search_result:

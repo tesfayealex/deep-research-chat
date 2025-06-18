@@ -2,7 +2,7 @@
 
 # Defines specifications for supported LLMs
 MODEL_SPECS = {
-    "gemini-2.0-flash": {
+    "gemini-2.5-flash": {  
         "provider": "google",
         "context_length": 1048576, # According to recent Google announcements for 1.5 Flash
         "default_params": {"temperature": 0}
@@ -12,12 +12,31 @@ MODEL_SPECS = {
         "context_length": 128000, # Standard context window for GPT-4o mini
         "default_params": {"temperature": 0}
     },
-    # Add other models here if needed in the future
-    # "gpt-4o": {
-    #     "provider": "openai",
-    #     "context_length": 128000,
-    #     "default_params": {"temperature": 0}
-    # }
+    "gpt-4o": {
+        "provider": "openai",
+        "context_length": 128000,
+        "default_params": {"temperature": 0}
+    },
+    "gpt-3.5-turbo": {
+        "provider": "openai",
+        "context_length": 16385,
+        "default_params": {"temperature": 0}
+    },
+    "claude-3-5-sonnet-20241022": {
+        "provider": "anthropic",
+        "context_length": 200000,
+        "default_params": {"temperature": 0}
+    },
+    "claude-3-5-haiku-20241022": {
+        "provider": "anthropic", 
+        "context_length": 200000,
+        "default_params": {"temperature": 0}
+    },
+    "claude-3-opus-20240229": {
+        "provider": "anthropic",
+        "context_length": 200000,
+        "default_params": {"temperature": 0}
+    }
 }
 
 def get_model_spec(model_name: str) -> dict:

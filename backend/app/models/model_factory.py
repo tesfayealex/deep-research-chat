@@ -2,6 +2,13 @@ from langchain_openai import ChatOpenAI
 from langchain_google_genai import ChatGoogleGenerativeAI
 from langchain_core.language_models import BaseChatModel
 
+try:
+    from langchain_anthropic import ChatAnthropic
+    ANTHROPIC_AVAILABLE = True
+except ImportError:
+    ANTHROPIC_AVAILABLE = False
+    print("Warning: langchain_anthropic not available. Anthropic models will not work.")
+
 from .model_registry import get_model_spec
 from ..config import settings # Import the validated settings
 
@@ -64,6 +71,21 @@ def create_model(model_name: str, **kwargs) -> BaseChatModel:
                  
             model_instance = ChatGoogleGenerativeAI(model=model_name, **final_params)
         
+        elif provider == "anthropic":
+            if not ANTHROPIC_AVAILABLE:
+                raise ValueError("langchain_anthropic package is required for Anthropic models. Install with: pip install langchain-anthropic")
+            
+            if not settings.ANTHROPIC_API_KEY or settings.ANTHROPIC_API_KEY == "YOUR_ANTHROPIC_API_KEY_HERE":
+                raise ValueError("ANTHROPIC_API_KEY not found in settings for Anthropic model.")
+            
+            # Ensure the key is available in the environment where ChatAnthropic looks for it
+            import os
+            if "ANTHROPIC_API_KEY" not in os.environ and settings.ANTHROPIC_API_KEY:
+                os.environ["ANTHROPIC_API_KEY"] = settings.ANTHROPIC_API_KEY
+                print("Set ANTHROPIC_API_KEY in environment for ChatAnthropic")
+            
+            model_instance = ChatAnthropic(model=model_name, **final_params)
+        
         else:
             raise ValueError(f"Unsupported provider '{provider}' for model '{model_name}'.")
             
@@ -97,4 +119,20 @@ def get_report_model(**kwargs) -> BaseChatModel:
        Add REPORT_MODEL_NAME to config if a separate model is desired.
     """
     model_name = settings.REPORT_MODEL_NAME if hasattr(settings, 'REPORT_MODEL_NAME') and settings.REPORT_MODEL_NAME else settings.MAIN_MODEL_NAME
+    return create_model(model_name, **kwargs)
+
+def get_reflection_model(**kwargs) -> BaseChatModel:
+    """Gets the reflection model instance specified in settings.
+       Defaults to MAIN_MODEL_NAME.
+       Uses REFLECTION_MODEL_NAME from config if specified.
+    """
+    model_name = settings.REFLECTION_MODEL_NAME if hasattr(settings, 'REFLECTION_MODEL_NAME') and settings.REFLECTION_MODEL_NAME else settings.MAIN_MODEL_NAME
+    return create_model(model_name, **kwargs)
+
+def get_plan_extension_model(**kwargs) -> BaseChatModel:
+    """Gets the plan extension model instance specified in settings.
+       Defaults to MAIN_MODEL_NAME.
+       Uses PLAN_EXTENSION_MODEL_NAME from config if specified.
+    """
+    model_name = settings.PLAN_EXTENSION_MODEL_NAME if hasattr(settings, 'PLAN_EXTENSION_MODEL_NAME') and settings.PLAN_EXTENSION_MODEL_NAME else settings.MAIN_MODEL_NAME
     return create_model(model_name, **kwargs)

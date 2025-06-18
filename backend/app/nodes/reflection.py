@@ -9,10 +9,10 @@ import json
 import logging
 from typing import Dict, List, Any
 from langchain_core.messages import HumanMessage, SystemMessage
-from langchain_openai import ChatOpenAI
 
 from ..schemas import AgentState
 from ..config import settings
+from ..models.model_factory import get_reflection_model
 
 # Set up logging
 logger = logging.getLogger(__name__)
@@ -35,13 +35,12 @@ async def reflection_node(state: AgentState) -> Dict[str, Any]:
         Updated state with reflection results and recommendations
     """
     logger.info("🔍 Starting mandatory reflection analysis...")
+    print(f"Using reflection model: {settings.REFLECTION_MODEL_NAME}")
     
     try:
-        # Initialize reflection model
-        reflection_model = ChatOpenAI(
-            model=settings.REFLECTION_MODEL_NAME,
-            temperature=0.1,  # Lower temperature for more consistent analysis
-            api_key=settings.OPENAI_API_KEY
+        # Initialize reflection model using model factory
+        reflection_model = get_reflection_model(
+            temperature=0.1  # Lower temperature for more consistent analysis
         )
         
         # Prepare reflection analysis

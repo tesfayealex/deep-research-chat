@@ -83,6 +83,7 @@ async def plan_research(state: AgentState) -> Dict:
              raise ValueError("Plan generation resulted in no valid steps after validation.")
              
         print(f"Planner generated plan (validated): {validated_plan}")
+        print(llm.model_dump_json())
         ai_message = f"Generated a plan with {len(validated_plan)} steps."
         # --- End Step Validation ---
          
