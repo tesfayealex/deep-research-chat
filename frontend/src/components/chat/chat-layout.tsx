@@ -8,13 +8,20 @@ import { Sidebar } from './sidebar';
 import { Button } from '@/components/ui/button';
 import { ScrollArea } from '@/components/ui/scroll-area';
 
+// Define the structure for a Source
+export interface Source {
+  label: string;
+  original_url: string;
+  short_url?: string; // Optional short URL
+}
+
 // Define StepResult type (matches backend step_result data)
 export interface StepResult {
   step_index: number;
   step_name?: string;
   findings_preview?: string;
-  sources?: string[];
-  [key: string]: any; 
+  sources?: (string | Source)[]; // Can be an array of strings or Source objects
+  [key: string]: any;
 }
 
 // Define Message structure (used by UI components)

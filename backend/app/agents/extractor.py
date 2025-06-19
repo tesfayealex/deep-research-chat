@@ -15,27 +15,9 @@ from ..models.model_registry import get_context_length # Needed for context chec
 from ..memory.compression import compress_text_to_fit_context, estimate_tokens # Import compression utils
 from langchain_core.prompts import ChatPromptTemplate, MessagesPlaceholder
 
-# Simple regex to find potential URLs
-URL_REGEX = r"https?://[\w\./\-?=&%#]+"
-
-def parse_urls_from_search(search_result: str, max_urls: int = 5) -> List[str]:
-    """Extracts URLs from raw search result text."""
-    # This is a basic implementation. Assumes URLs are plain text.
-    # If Tavily returns structured data, parsing should be adapted.
-    urls = re.findall(URL_REGEX, search_result)
-    # Simple deduplication and limit
-    unique_urls = list(dict.fromkeys(urls))
-    print(f"Parsed {len(unique_urls)} unique URLs from search results.")
-    return unique_urls[:max_urls]
-
 async def execute_step(state: AgentState) -> Dict:
     """
-    Executes the current step using LLM-generated sub-queries.
-    This involves: 
-    1. Using an LLM to analyze the step and generate targeted sub-queries.
-    2. Prioritizing and executing sub-queries based on the tool call budget.
-    3. Performing web searches, extracting content, and handling potential retries.
-    4. Using an LLM to synthesize findings from all executed queries.
+    Executes the current step using either a direct search or LLM-generated sub-queries.
     
     Args:
         state: The current AgentState.
@@ -48,8 +30,6 @@ async def execute_step(state: AgentState) -> Dict:
     current_index = state.get('current_step_index', 0)
     previous_step_results = state.get('step_results', [])[:current_index]
     overall_goal = state.get('query', "")
-    max_repetitions = settings.MAX_STEP_REPETITIONS # Keep for retry logic
-    print(f"(Max step repetitions configured: {max_repetitions})" )
     
     global_tool_calls = state.get('global_tool_calls', 0)
     step_results = list(state.get('step_results', []))
@@ -73,266 +53,103 @@ async def execute_step(state: AgentState) -> Dict:
     step_data = step_results[current_index]
     step_data.update({"step_name": step_name, "step_detail": step_detail})
     
-    # --- 1. Build Context --- 
     context_summary = build_context_from_previous_steps(previous_step_results)
-    
-    # Check search method from configuration
     search_method = settings.SEARCH_METHOD.lower()
-    print(f"Using search method: {search_method}")
+    available_calls = settings.MAX_TOOL_CALLS_PER_STEP
+    print(f"Using search method: {search_method} with budget: {available_calls} calls")
     
+    final_findings = "No results found for this step."
+    final_sources = []
+
     if search_method == "direct":
-        # --- Direct Search Method: Single comprehensive search using Gemini ---
-        available_calls = settings.MAX_TOOL_CALLS_PER_STEP
         print(f"Executing direct search for step: '{step_detail}'")
-        
         try:
-            # Perform single comprehensive search
-            search_result = await perform_web_search(step_detail, None,state.get('current_step_index', 0))
+            search_findings, search_sources = await perform_web_search(
+                step_detail, None, state.get('current_step_index', 0)
+            )
             step_tool_calls += 1
             global_tool_calls += 1
             
-            if search_result:
+            if search_findings:
                 print(f"Direct search successful for '{step_detail}'")
-                # For direct search, the result is already synthesized by Gemini
-                final_findings = search_result
-                final_sources = ["Gemini Google Search API - Comprehensive Research"]
-                
-                step_data['search_method'] = 'direct'
-                step_data['direct_search_query'] = step_detail
-                step_data['queries_attempted_count'] = 1
-                step_data['queries_successful_count'] = 1
-                
+                final_findings = search_findings
+                final_sources = search_sources
+                step_data.update({
+                    'search_method': 'direct',
+                    'direct_search_query': step_detail,
+                    'queries_attempted_count': 1,
+                    'queries_successful_count': 1
+                })
             else:
                 print(f"Direct search returned no results for '{step_detail}'")
-                final_findings = "No results found from direct search."
-                final_sources = []
-            available_calls -= 1
-                
         except Exception as e:
             error_msg = f"Error during direct search: {e}"
             print(error_msg)
             final_findings = f"Error performing direct search: {e}"
-            final_sources = []
             updates["error"] = error_msg
     
-    else:
-        # --- Sub-Query Search Method: Original multi-step approach ---
-        print(f"Executing sub-query search method")
-        
-        # --- 2. Generate Sub-Queries via LLM --- 
-        available_calls = settings.MAX_TOOL_CALLS_PER_STEP
-        print(f"Generating agentic sub-queries (Budget: {available_calls} calls)")
-        
+    else: # Sub-Query Search Method
+        print("Executing sub-query search method")
         try:
             sub_queries = await generate_agentic_sub_queries(
-                step_detail, 
-                overall_goal, 
-                context_summary, 
-                # Pass budget hint to LLM (optional, but can help guide generation)
-                max_queries_hint=available_calls 
+                state, max_queries_hint=available_calls
             )
             if not sub_queries:
-                print("LLM did not generate sub-queries. Falling back to step detail.")
-                sub_queries = [step_detail] # Fallback
-            else:
-                 print(f"LLM generated {len(sub_queries)} sub-queries.")
-                 step_data['llm_generated_queries'] = sub_queries
-                 
+                sub_queries = [step_detail]
+            print(f"Generated {len(sub_queries)} sub-queries.")
+            step_data['llm_generated_queries'] = sub_queries
         except Exception as e:
-            print(f"Error generating agentic sub-queries: {e}. Falling back to step detail.")
-            sub_queries = [step_detail] # Fallback on error
+            print(f"Error generating sub-queries: {e}. Falling back to step detail.")
+            sub_queries = [step_detail]
             updates["error"] = f"Failed to generate sub-queries: {e}"
         
-        # --- 3. Execute Sub-Queries within Budget ---
-        print(f"Executing queries within budget: {available_calls} calls total for step")
-        
-        all_search_results = []
-        all_extracted_contents = []
+        all_findings = []
+        all_sources = []
         attempted_queries = []
         successful_queries = []
         
-        # Simple budget allocation: Prioritize searches, then URL extractions
-        # Let's reserve ~1 call per potential URL extraction (assume 2 URLs per search avg)
-        search_call_limit = max(1, available_calls // 3) # Min 1 search, use up to 1/3 budget
-        queries_to_attempt = sub_queries[:search_call_limit] # Prioritize first N queries from LLM
-        
-        print(f"Attempting up to {len(queries_to_attempt)} searches (Search call limit: {search_call_limit})")
+        search_call_limit = max(1, available_calls // 2)
+        queries_to_attempt = sub_queries[:search_call_limit]
 
-        for i, query in enumerate(queries_to_attempt):
+        for query in queries_to_attempt:
             if step_tool_calls >= available_calls:
-                print(f"Stopping searches early: Budget limit reached ({step_tool_calls}/{available_calls})")
+                print("Stopping searches: Budget limit reached.")
                 break
             
-            # Validate query before processing
-            if not query or not query.strip() or len(query.strip()) < 3:
-                print(f"⚠️ Skipping invalid/empty query: '{query}'")
-                attempted_queries.append(query)  # Track as attempted for logging
+            clean_query = query.strip()
+            if not clean_query or len(clean_query) < 3:
                 continue
                 
-            clean_query = query.strip()
-            print(f"Executing sub-query {i+1}/{len(queries_to_attempt)}: '{clean_query}'")
+            print(f"Executing sub-query: '{clean_query}'")
             attempted_queries.append(clean_query)
-            
             try:
-                search_result = await perform_web_search(clean_query, None, state.get('current_step_index', 0))
+                search_findings, search_sources = await perform_web_search(
+                    clean_query, None, state.get('current_step_index', 0)
+                )
                 step_tool_calls += 1
                 global_tool_calls += 1
                 
-                if search_result:
-                    all_search_results.append({"query": clean_query, "result": search_result})
+                if search_findings:
+                    all_findings.append(search_findings)
+                    all_sources.extend(search_sources)
                     successful_queries.append(clean_query)
-                    print(f"Search successful for '{clean_query}'")
-                else:
-                    print(f"No results found for '{clean_query}'")
+                    print(f"Search and synthesis successful for '{clean_query}'")
             except Exception as e:
-                print(f"Error searching for '{clean_query}': {e}")
-                # Continue with next query on error, don't increment step_tool_calls if search tool failed internally
+                print(f"Error processing sub-query '{clean_query}': {e}")
 
         step_data['queries_attempted_count'] = len(attempted_queries)
         step_data['queries_successful_count'] = len(successful_queries)
 
-        # --- 4. Retry Failed Queries (Optional & Simple) ---
-        # Simple retry logic if budget allows (can be removed if LLM generation is robust)
-        failed_queries = [q for q in attempted_queries if q not in successful_queries]
-        if failed_queries and max_repetitions > 0 and step_tool_calls < available_calls:
-            print(f"Attempting simple retry for {len(failed_queries)} failed queries...")
-            retry_budget = min(len(failed_queries), available_calls - step_tool_calls) # How many calls left for retries?
-            
-            for i, failed_query in enumerate(failed_queries[:retry_budget]):
-                refined_query = refine_failed_query(failed_query) # Use simple refinement
-                print(f"Retrying {i+1}/{retry_budget} with: '{refined_query}'")
-                try:
-                    search_result = await perform_web_search(refined_query, None, state.get('current_step_index', 0))
-                    step_tool_calls += 1
-                    global_tool_calls += 1
-                    if search_result:
-                        all_search_results.append({"query": refined_query, "result": search_result}) # Add retry results
-                        successful_queries.append(refined_query) # Mark as successful
-                        print(f"Retry successful for '{refined_query}'")
-                except Exception as e:
-                     print(f"Error during retry search for '{refined_query}': {e}")
-
-        # --- 5. Extract URLs and Content ---
-        if all_search_results:
-            # Extract URLs from all successful search results
-            all_urls_info = []
-            for result_info in all_search_results:
-                urls = parse_urls_from_search(result_info["result"], max_urls=settings.TAVILY_MAX_RESULTS)
-                all_urls_info.extend([{"url": url, "source_query": result_info["query"]} for url in urls])
-            
-            unique_urls_info = []
+        if all_findings:
+            final_findings = "\n\n---\n\n".join(all_findings)
             seen_urls = set()
-            for url_info in all_urls_info:
-                if url_info["url"] not in seen_urls:
-                    unique_urls_info.append(url_info)
-                    seen_urls.add(url_info["url"])
-            
-            print(f"Found {len(unique_urls_info)} unique URLs across successful searches.")
-            
-            # Extract content from ALL URLs found (not limited by step tool calls)
-            # URL extraction is crucial for research quality and should not be artificially limited
-            if unique_urls_info:
-                print(f"Extracting content from ALL {len(unique_urls_info)} URLs (unlimited extraction)")
-                extraction_tasks = []
-                for url_info in unique_urls_info:
-                    extraction_tasks.append(extract_text_from_url(url_info["url"]))
-                    # Note: We still count tool calls for tracking but don't limit extraction
-                    step_tool_calls += 1
-                    global_tool_calls += 1
-
-                if extraction_tasks:
-                    extraction_results = await asyncio.gather(*extraction_tasks, return_exceptions=True)
-                    
-                    for i, res in enumerate(extraction_results):
-                        url_info = unique_urls_info[i]
-                        url = url_info["url"]
-                        source_query = url_info["source_query"]
-                        
-                        if isinstance(res, Exception):
-                            print(f"Failed extraction from {url}: {res}")
-                            if "extraction_errors" not in step_data: step_data["extraction_errors"] = []
-                            step_data["extraction_errors"].append(f"{url}: {str(res)}")
-                        elif isinstance(res, dict) and res.get("text") and not res.get("error"):
-                            res["source_query"] = source_query # Add originating query info
-                            all_extracted_contents.append(res)
-                            print(f"Extracted content from {url} (from query: '{source_query}')")
-                        elif isinstance(res, dict) and res.get("error"):
-                            print(f"Error extracting from {url}: {res.get('error')}")
-                            if "extraction_errors" not in step_data: step_data["extraction_errors"] = []
-                            step_data["extraction_errors"].append(f"{url}: {res.get('error')}")
+            unique_sources = []
+            for source in all_sources:
+                if source['original_url'] not in seen_urls:
+                    unique_sources.append(source)
+                    seen_urls.add(source['original_url'])
+            final_sources = unique_sources
         
-        # --- 6. Synthesize Findings with LLM ---
-        final_findings = "No actionable content found or processed for this step."
-        final_sources = []
-
-        if all_extracted_contents:
-            print(f"Synthesizing findings from {len(all_extracted_contents)} extracted contents...")
-            # Organize content by the query that led to it
-            content_by_query = {}
-            for content in all_extracted_contents:
-                query = content.get("source_query", "Unknown Query")
-                if query not in content_by_query: content_by_query[query] = []
-                content_by_query[query].append(content)
-
-            # Format combined text for LLM synthesis
-            combined_text_parts = [f"=== Content related to query: '{query}' ===" + 
-                                   "\n".join([f"---\nSource: {c['source']}\n{c['text']}\n---" 
-                                             for c in contents]) 
-                                   for query, contents in content_by_query.items()]
-            combined_text_str = "\n\n".join(combined_text_parts)
-            
-            try:
-                extraction_llm = get_extraction_model() # Use extraction model for synthesis
-                
-                synthesis_prompt_template = ChatPromptTemplate.from_messages([
-                    SystemMessage(content=f"""You are an AI assistant synthesizing information gathered from multiple targeted web searches to answer a specific research step.
-                    Overall Research Goal: {overall_goal}
-                    Current Step Goal: {step_detail}
-                    Context from Previous Steps: {context_summary}
-
-                    Analyze the provided content, which is grouped by the search query that found it. 
-                    Synthesize a concise answer to the 'Current Step Goal', drawing ONLY from the provided text. Highlight key findings and mention any significant gaps based on the content provided. Structure the output clearly."""),
-                    HumanMessage(content="Extracted Content:\n\n{compressed_text}")
-                ])
-
-                prompt_base = synthesis_prompt_template.format(compressed_text="")
-                prompt_tokens = estimate_tokens(str(prompt_base))
-                
-                compressed_text = await compress_text_to_fit_context(
-                    combined_text_str,
-                    settings.EXTRACTION_MODEL_NAME, # Model used for synthesis
-                    prompt_buffer=prompt_tokens + 500
-                )
-                
-                final_prompt = synthesis_prompt_template.format(compressed_text=compressed_text)
-                processed_response = await extraction_llm.ainvoke(final_prompt)
-                
-                final_findings = processed_response.content
-                final_sources = [content["source"] for content in all_extracted_contents]
-                
-                step_data["tokens_before_compression"] = estimate_tokens(combined_text_str)
-                step_data["tokens_after_compression"] = estimate_tokens(compressed_text)
-                print(f"Synthesis complete. Findings preview: {final_findings[:200]}...")
-
-            except Exception as e:
-                error_msg = f"Error during synthesis: {e}"
-                print(error_msg)
-                final_findings = f"Error synthesizing results: {e}. See raw extracted content."
-                # Keep extracted sources even if synthesis fails
-                final_sources = [content["source"] for content in all_extracted_contents] 
-                step_data["synthesis_error"] = error_msg # Log synthesis error
-
-        elif all_search_results: # Fallback if only search results, no content
-            print("Using raw search results as findings due to lack of extracted content.")
-            # print(res_info)
-            # print("#####################################")
-            print(all_search_results)
-            final_findings = "Could not extract content from URLs. Raw search result snippets:\n\n"
-            for res_info in all_search_results:
-                final_findings += f"Query: '{res_info['query']}'\nResult: {res_info['result'][:250]}...\n\n"
-            final_sources = [f"Search result for: {res_info['query']}" for res_info in all_search_results]
-        
-    # --- 7. Update State ---
     step_data["tool_calls_used"] = step_tool_calls
     step_data["findings"] = final_findings
     step_data["sources"] = final_sources
@@ -363,12 +180,19 @@ def build_context_from_previous_steps(previous_step_results: List[Dict]) -> str:
         context_summary += f"- {prev_step_name}: {str(findings)[:100]}...\n" 
     return context_summary
 
-async def generate_agentic_sub_queries(step_detail: str, overall_goal: str, context_summary: str, max_queries_hint: int) -> List[str]:
+async def generate_agentic_sub_queries(state: AgentState, max_queries_hint: int) -> List[str]:
     """
     Uses an LLM to generate targeted search queries based on the step goal and context.
     """
     print("Using LLM to generate targeted sub-queries...")
     
+    current_index = state.get('current_step_index', 0)
+    plan = state.get('plan', [])
+    step_detail = plan[current_index].get("step_detail", "") if plan and current_index < len(plan) else ""
+    overall_goal = state.get('query', "")
+    previous_step_results = state.get('step_results', [])[:current_index]
+    context_summary = build_context_from_previous_steps(previous_step_results)
+
     # Validate inputs
     if not step_detail or not step_detail.strip():
         print("⚠️ Empty or invalid step detail provided")

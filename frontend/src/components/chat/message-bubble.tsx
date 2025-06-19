@@ -72,29 +72,32 @@ const RenderStepsContent: React.FC<{ steps: StepResult[] }> = ({ steps }) => {
                   <div className="flex flex-wrap items-center gap-x-2 gap-y-1 pt-1">
                     <span className="text-xs font-medium text-foreground">Sources:</span>
                     {step.sources.map((source, srcIndex) => {
-                      if (isValidUrl(source)) {
+                      const url = typeof source === 'string' ? source : source.original_url;
+                      const label = typeof source === 'string' ? new URL(url).hostname : source.label;
+
+                      if (isValidUrl(url)) {
                         // If it's a valid URL, render the link
                         return (
-                          <a 
-                            key={srcIndex} 
-                            href={source} 
-                            target="_blank" 
+                          <a
+                            key={srcIndex}
+                            href={url}
+                            target="_blank"
                             rel="noopener noreferrer"
                             className="inline-flex items-center gap-1 text-xs text-blue-500 hover:text-blue-600 dark:text-blue-400 dark:hover:text-blue-500 underline truncate max-w-[200px]"
                           >
                             <LinkIcon size={12} />
-                            <span>{new URL(source).hostname}</span> 
+                            <span>{label || new URL(url).hostname}</span>
                           </a>
                         );
                       } else {
-                        // If it's not a valid URL, render as plain text
+                        // Fallback for any non-URL string data
                         return (
-                          <span 
-                            key={srcIndex} 
+                          <span
+                            key={srcIndex}
                             className="text-xs text-muted-foreground truncate max-w-[200px]"
-                            title={source} // Show full text on hover
+                            title={String(source)} // Show full text on hover
                           >
-                            {source} 
+                            {String(source)}
                           </span>
                         );
                       }

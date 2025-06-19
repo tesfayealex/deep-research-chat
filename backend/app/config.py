@@ -33,7 +33,7 @@ class Settings(BaseSettings):
     MAX_URLS_TO_SCRAPE: int = int(os.getenv("MAX_URLS_TO_SCRAPE", 3)) # Max URLs to fetch per extraction step
     MAX_TOTAL_REQUEST_TOKENS: int = int(os.getenv("MAX_TOTAL_REQUEST_TOKENS", 4000)) # Safety limit for LLM input tokens
     MAX_STEP_REPETITIONS: int = int(os.getenv("MAX_STEP_REPETITIONS", "2")) # Max internal retries/refinements within executor step
-    SEARCH_METHOD: str = os.getenv("SEARCH_METHOD", "subquery")  # "subquery" or "direct"
+    SEARCH_METHOD: str = os.getenv("SEARCH_METHOD", "direct")  # "subquery" or "direct"
 
     # --- URL Extraction / Scraping ---
     SCRAPE_TIMEOUT: int = int(os.getenv("SCRAPE_TIMEOUT", 10)) # Timeout in seconds for fetching URL content

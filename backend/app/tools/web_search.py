@@ -1,8 +1,15 @@
-from langchain_community.tools.tavily_search import TavilySearchResults
-from ..config import settings
-from typing import List, Any, Dict
+import asyncio
 import datetime
-import os
+from typing import Any, Dict, List, Tuple
+
+from langchain_community.tools.tavily_search import TavilySearchResults
+from langchain_core.messages import HumanMessage, SystemMessage
+from langchain_core.output_parsers import StrOutputParser
+from langchain_core.prompts import ChatPromptTemplate
+
+from ..config import settings
+from ..models.model_factory import get_main_model
+from ..tools.url_extractor import extract_text_from_url
 
 # Import for direct search method
 try:
@@ -13,32 +20,103 @@ except ImportError:
     print("Warning: google.genai not available. Direct search method will not work.")
 
 def get_tavily_tool() -> TavilySearchResults:
-    """Initializes and returns the Tavily search tool based on settings."""
-    # TODO: Add error handling for API key missing
-    # TODO: Potentially allow overriding max_results via function args
-    print(f"Initializing Tavily Search with max_results={settings.TAVILY_MAX_RESULTS}")
-    return TavilySearchResults(max_results=settings.TAVILY_MAX_RESULTS)
+    """Initializes and returns the Tavily search tool."""
+    return TavilySearchResults(
+        api_key=settings.TAVILY_API_KEY,
+        max_results=settings.TAVILY_MAX_RESULTS,
+        search_depth="advanced",
+    )
 
-async def perform_web_search_tavily(query: str, max_results: int | None = None) -> str:
-    """Performs a Tavily search for the given query (original subquery method)."""
+async def perform_web_search_tavily(
+    query: str, max_results: int | None = None, state_name: str = ""
+) -> Tuple[str, List[Dict[str, Any]]]:
+    """
+    Performs a Tavily search, extracts content from URLs, synthesizes it with citations,
+    and returns the result and sources.
+    """
     search_tool = get_tavily_tool()
     if max_results:
-        search_tool.max_results = max_results # Allow override
-    
-    try:
-        result = await search_tool.ainvoke({"query": query})
-        # Result format might vary, adjust extraction if needed.
-        # Often it's a list of dicts or a string summary.
-        print(f"Tavily search for '{query}' returned: {str(result)[:200]}...")
-        # Ensure a consistent string output for the agent
-        print(result)
-        wefewfwefew
-        return str(result) 
-    except Exception as e:
-        print(f"Error during Tavily search for '{query}': {e}")
-        return f"Error performing web search: {e}"
+        search_tool.max_results = max_results
 
-def perform_web_search_direct(query: str, state_name: str) -> str:
+    try:
+        tavily_results = await search_tool.ainvoke({"query": query})
+        if not tavily_results:
+            print(f"Tavily search for '{query}' returned no results.")
+            return "No search results found.", []
+
+        print(f"Tavily search for '{query}' returned {len(tavily_results)} results.")
+        urls_to_process = [res["url"] for res in tavily_results if res.get("url")]
+        url_metadata = {
+            res["url"]: {"title": res.get("title", "No Title")}
+            for res in tavily_results
+            if res.get("url")
+        }
+
+        if not urls_to_process:
+            return "Search results contained no usable URLs.", []
+
+        resolved_urls_map = resolve_urls(urls_to_process, state_name, source="tavily")
+        print(f"Extracting content from {len(urls_to_process)} URLs...")
+        extraction_tasks = [extract_text_from_url(url) for url in urls_to_process]
+        extraction_results = await asyncio.gather(
+            *extraction_tasks, return_exceptions=True
+        )
+
+        combined_content = ""
+        valid_extractions = []
+        for i, res in enumerate(extraction_results):
+            url = urls_to_process[i]
+            if isinstance(res, dict) and res.get("text") and not res.get("error"):
+                short_url = resolved_urls_map.get(url)
+                title = url_metadata.get(url, {}).get("title", "Source")
+                combined_content += f'Source: [{title}]({short_url})\nURL: {url}\nContent:\n{res["text"]}\n\n---\n\n'
+                valid_extractions.append(
+                    {
+                        "url": url,
+                        "short_url": short_url,
+                        "title": title,
+                        "content": res["text"],
+                    }
+                )
+            else:
+                print(f"Failed to extract content from {url}: {res}")
+
+        if not combined_content:
+            return "Could not extract any content from the search result URLs.", []
+
+        synthesis_model = get_main_model()
+        synthesis_prompt = ChatPromptTemplate.from_messages(
+            [
+                SystemMessage(
+                    content=f'You are an expert research analyst. Your task is to synthesize the provided text, which has been extracted from various web sources.\n\nHere is the user\'s original query: "{query}"\n\nInstructions:\n1.  Analyze the provided content, which includes the source URL (shortened) and the extracted text.\n2.  Create a comprehensive, synthesized response that directly answers the user\'s query.\n3.  **Crucially, you must cite your sources.** When you use information from a source, add a citation marker in markdown format, like this: `[Source Title](short_url)`.\n4.  Base your response ONLY on the information provided. Do not add any external knowledge.\n5.  If the provided content is insufficient to answer the query, state that clearly.\n6.  The output should be a well-structured and readable report.'
+                ),
+                HumanMessage(
+                    content=f"Here is the content to synthesize:\n\n{combined_content}"
+                ),
+            ]
+        )
+
+        chain = synthesis_prompt | synthesis_model | StrOutputParser()
+        synthesized_text = await chain.ainvoke({})
+        sources_list = [
+            {
+                "label": ve["title"],
+                "short_url": ve["short_url"],
+                "original_url": ve["url"],
+            }
+            for ve in valid_extractions
+        ]
+
+        print(f"Tavily synthesis for '{query}' completed.")
+        return synthesized_text, sources_list
+
+    except Exception as e:
+        print(f"Error during Tavily search and synthesis for '{query}': {e}")
+        return f"An error occurred: {e}", []
+
+def perform_web_search_direct(
+    query: str, state_name: str
+) -> Tuple[str, List[Dict[str, Any]]]:
     """Performs a direct search using Gemini's Google Search API tool."""
     if not GEMINI_AVAILABLE:
         raise ImportError("google.genai package is required for direct search method")
@@ -76,70 +154,90 @@ Research Topic:
             config={
                 "tools": [{"google_search": {}}],
                 "temperature": 0,
-            },
+            },      
         )
 
-        # print(response.text)
-
-         # resolve the urls to short urls for saving tokens and time
-        resolved_urls = resolve_urls(
-            response.candidates[0].grounding_metadata.grounding_chunks, state_name
-        )
-        # Gets the citations and adds them to the generated text
+        urls_to_resolve = [
+            chunk.web.uri
+            for chunk in response.candidates[0].grounding_metadata.grounding_chunks
+        ]
+        resolved_urls = resolve_urls(urls_to_resolve, state_name, source="gemini")
         citations = get_citations(response, resolved_urls)
         modified_text = insert_citation_markers(response.text, citations)
-        sources_gathered = [item for citation in citations for item in citation["segments"]]
+        sources_gathered = [
+            {
+                "label": item["label"],
+                "short_url": item["short_url"],
+                "original_url": item["value"],
+            }
+            for citation in citations
+            for item in citation["segments"]
+        ]
+
+        unique_sources = []
+        seen_urls = set()
+        for source in sources_gathered:
+            if source["original_url"] not in seen_urls:
+                unique_sources.append(source)
+                seen_urls.add(source["original_url"])
+
         print(f"Direct search for '{query}' completed. Usage: {response.usage_metadata}")
         print(sources_gathered)
         print("########################################################")
         print(modified_text)
         print("########################################################")
-        # print(citations)
-        wefffewfe
-        return response.text
+        return modified_text, unique_sources
         
     except Exception as e:
         print(f"Error during direct search for '{query}': {e}")
-        return f"Error performing direct web search: {e}"
+        return f"Error performing direct web search: {e}", []
 
-async def perform_web_search(query: str, max_results: int | None = None, state_name: str = "") -> str:
+async def perform_web_search(
+    query: str, max_results: int | None = None, state_name: str = ""
+) -> Tuple[str, List[Dict[str, Any]]]:
     """Unified search interface that switches between methods based on configuration."""
     search_method = settings.SEARCH_METHOD.lower()
     
     if search_method == "direct":
         print(f"Using direct search method for: '{query}'")
         try:
-            # Direct search is synchronous, but we're in an async context
-            result = perform_web_search_direct(query, state_name)
-            return result
+            loop = asyncio.get_running_loop()
+            result_text, result_sources = await loop.run_in_executor(
+                None, perform_web_search_direct, query, state_name
+            )
+            return result_text, result_sources
         except Exception as e:
             print(f"Direct search failed for '{query}': {e}")
             # Fallback to Tavily if direct search fails
             print("Falling back to Tavily search...")
-            return await perform_web_search_tavily(query, max_results)
+            return await perform_web_search_tavily(query, max_results, state_name)
     
     elif search_method == "subquery":
         print(f"Using subquery search method for: '{query}'")
-        return await perform_web_search_tavily(query, max_results)
+        return await perform_web_search_tavily(query, max_results, state_name)
     
     else:
         print(f"Unknown search method '{search_method}', defaulting to subquery method")
-        return await perform_web_search_tavily(query, max_results)
+        return await perform_web_search_tavily(query, max_results, state_name)
     
-def resolve_urls(urls_to_resolve: List[Any], id: int) -> Dict[str, str]:
+def resolve_urls(
+    urls_to_resolve: List[str], id: str, source: str = "gemini"
+) -> Dict[str, str]:
     """
-    Create a map of the vertex ai search urls (very long) to a short url with a unique id for each url.
-    Ensures each original URL gets a consistent shortened form while maintaining uniqueness.
+    Create a map of URLs to a short url with a unique id for each url.
     """
-    prefix = f"https://vertexaisearch.cloud.google.com/id/"
-    urls = [site.web.uri for site in urls_to_resolve]
-
-    # Create a dictionary that maps each unique URL to its first occurrence index
+    prefix = (
+        "https://tavily.com/id/"
+        if source == "tavily"
+        else "https://vertexaisearch.cloud.google.com/id/"
+    )
+    id_str = str(id)
     resolved_map = {}
-    for idx, url in enumerate(urls):
+    for idx, url in enumerate(
+        list(dict.fromkeys(urls_to_resolve))
+    ):  # Deduplicate URLs while preserving order
         if url not in resolved_map:
-            resolved_map[url] = f"{prefix}{id}-{idx}"
-
+            resolved_map[url] = f"{prefix}{id_str}-{idx}"
     return resolved_map
 
 def get_citations(response, resolved_urls_map):
